@@ -34,7 +34,7 @@ use session_store::{
     SessionStore, TaskFailFileEntry,
 };
 use theme::Theme;
-use workflow::{JobRun, WorkerRole, WorkflowFailure, WorkflowFailureKind};
+use workflow::{JobRun, StartedJob, WorkerRole, WorkflowFailure, WorkflowFailureKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectInfoStage {
@@ -205,7 +205,7 @@ fn start_next_worker_job_if_any(
     session_store: &SessionStore,
     model_routing: &CodexAgentModelRouting,
 ) {
-    if let Some(job) = app.start_next_worker_job() {
+    if let Some(job) = claim_next_worker_job_and_persist_snapshot(app, session_store) {
         dispatch_worker_job(
             &job,
             worker_agent_adapters,
@@ -219,11 +219,19 @@ fn start_next_worker_job_if_any(
             job.role, job.top_task_id
         ));
     }
+}
+
+fn claim_next_worker_job_and_persist_snapshot(
+    app: &mut App,
+    session_store: &SessionStore,
+) -> Option<StartedJob> {
+    let job = app.start_next_worker_job();
     if let Err(err) = persist_runtime_tasks_snapshot(app, session_store) {
         app.push_agent_message(format!(
             "System: Failed to persist runtime task status to tasks.json: {err}"
         ));
     }
+    job
 }
 
 fn run_app(
@@ -1487,7 +1495,7 @@ fn submit_user_message(
         for system_message in app.start_execution() {
             app.push_agent_message(system_message);
         }
-        if let Some(job) = app.start_next_worker_job() {
+        if let Some(job) = claim_next_worker_job_and_persist_snapshot(app, active_session) {
             dispatch_worker_job(
                 &job,
                 worker_agent_adapters,

@@ -364,6 +364,59 @@ fn persist_runtime_tasks_snapshot_writes_updated_subtask_statuses() {
 }
 
 #[test]
+fn start_execution_claim_persists_first_job_status_immediately() {
+    let mut app = App::default();
+    app.sync_planner_tasks_from_file(vec![
+        PlannerTaskFileEntry {
+            id: "top".to_string(),
+            title: "Task".to_string(),
+            details: "top details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Task,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: None,
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "impl".to_string(),
+            title: "Implementation".to_string(),
+            details: "impl details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Implementor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "impl-audit".to_string(),
+            title: "Audit".to_string(),
+            details: "audit details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Auditor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("impl".to_string()),
+            order: Some(0),
+        },
+    ])
+    .expect("sync should succeed");
+    let (store, session_dir) = open_temp_store("metaagent-start-persist-first-dispatch");
+
+    app.start_execution();
+    let first_job =
+        claim_next_worker_job_and_persist_snapshot(&mut app, &store).expect("first worker job");
+    assert!(matches!(first_job.run, JobRun::AgentPrompt(_)));
+
+    let persisted = store.read_tasks().expect("read persisted tasks");
+    let impl_status = persisted
+        .iter()
+        .find(|entry| entry.id == "impl")
+        .map(|entry| entry.status);
+    assert_eq!(impl_status, Some(PlannerTaskStatusFile::InProgress));
+
+    let _ = std::fs::remove_dir_all(&session_dir);
+}
+
+#[test]
 fn integration_happy_path_persists_and_reloads_cleanly() {
     let mut app = App::default();
     app.sync_planner_tasks_from_file(integration_plan_with_final())
