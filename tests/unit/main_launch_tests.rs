@@ -122,7 +122,9 @@ fn slash_commands_do_not_route_to_master() {
     assert!(!should_send_to_master("/merge-tests"));
     assert!(!should_send_to_master("/add-final-audit"));
     assert!(!should_send_to_master("/remove-final-audit"));
-    assert!(should_send_to_master("start execution"));
+    assert!(!should_send_to_master("start execution"));
+    assert!(!should_send_to_master("run tasks"));
+    assert!(!should_send_to_master("start"));
     assert!(should_send_to_master("hello"));
 }
 
@@ -195,19 +197,106 @@ fn task_check_allows_only_quit_commands() {
 #[test]
 fn submit_block_reason_prioritizes_project_info_and_respects_task_check_quit_escape() {
     assert_eq!(
-        submit_block_reason(true, false, true, "/quit"),
+        submit_block_reason(true, false, true, false, "/quit"),
         Some(SubmitBlockReason::ProjectInfoGathering)
     );
     assert_eq!(
-        submit_block_reason(false, false, true, "hello"),
+        submit_block_reason(false, false, true, false, "hello"),
         Some(SubmitBlockReason::TaskCheck)
     );
     assert_eq!(
-        submit_block_reason(false, true, false, "hello"),
+        submit_block_reason(false, true, false, false, "hello"),
         Some(SubmitBlockReason::MasterBusy)
     );
-    assert_eq!(submit_block_reason(false, false, true, "/quit"), None);
-    assert_eq!(submit_block_reason(false, false, false, "hello"), None);
+    assert_eq!(
+        submit_block_reason(false, false, true, false, "/quit"),
+        None
+    );
+    assert_eq!(
+        submit_block_reason(false, false, false, false, "hello"),
+        None
+    );
+}
+
+#[test]
+fn execution_busy_blocks_master_and_task_editing_commands() {
+    assert_eq!(
+        submit_block_reason(false, false, false, true, "Please update tasks"),
+        Some(SubmitBlockReason::ExecutionBusy)
+    );
+    assert_eq!(
+        submit_block_reason(false, false, false, true, "/newmaster"),
+        Some(SubmitBlockReason::ExecutionBusy)
+    );
+    assert_eq!(
+        submit_block_reason(false, false, false, true, "/resume"),
+        Some(SubmitBlockReason::ExecutionBusy)
+    );
+    assert_eq!(
+        submit_block_reason(false, false, false, true, "/split-audits"),
+        Some(SubmitBlockReason::ExecutionBusy)
+    );
+    assert_eq!(
+        submit_block_reason(false, false, false, true, "/add-final-audit"),
+        Some(SubmitBlockReason::ExecutionBusy)
+    );
+    assert_eq!(
+        submit_block_reason(false, false, false, true, "/quit"),
+        None
+    );
+    assert_eq!(
+        submit_block_reason(false, false, false, true, "/start"),
+        None
+    );
+}
+
+#[test]
+fn post_completion_tail_drain_collects_late_worker_output() {
+    let adapter = CodexAdapter::with_config(CodexCommandConfig {
+        program: "bash".to_string(),
+        args_prefix: vec![
+            "-lc".to_string(),
+            "(sleep 0.03; printf 'late\\n') & printf 'early\\n'".to_string(),
+        ],
+        output_mode: AdapterOutputMode::PlainText,
+        persistent_session: true,
+        model: None,
+        model_reasoning_effort: None,
+    });
+    adapter.send_prompt("ignored".to_string());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut saw_completed = false;
+    let mut saw_late_before_completion = false;
+    while std::time::Instant::now() < deadline {
+        for event in adapter.drain_events() {
+            match event {
+                AgentEvent::Output(line) => {
+                    if line.trim() == "late" {
+                        saw_late_before_completion = true;
+                    }
+                }
+                AgentEvent::Completed { .. } => {
+                    saw_completed = true;
+                }
+                AgentEvent::System(_) => {}
+            }
+        }
+        if saw_completed {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(saw_completed, "expected completed event");
+    let tail = drain_post_completion_worker_events(&adapter);
+    let saw_late_in_tail = tail
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Output(line) if line.trim() == "late"));
+    assert!(
+        saw_late_before_completion || saw_late_in_tail,
+        "expected delayed output to be observable either before completion or in post-completion tail"
+    );
 }
 
 #[test]
@@ -215,20 +304,14 @@ fn master_report_prompt_queue_serializes_dispatch() {
     let mut in_flight = false;
     let mut queue = std::collections::VecDeque::new();
 
-    let first = enqueue_or_dispatch_master_report_prompt(
-        "first".to_string(),
-        &mut in_flight,
-        &mut queue,
-    );
+    let first =
+        enqueue_or_dispatch_master_report_prompt("first".to_string(), &mut in_flight, &mut queue);
     assert_eq!(first.as_deref(), Some("first"));
     assert!(in_flight);
     assert!(queue.is_empty());
 
-    let second = enqueue_or_dispatch_master_report_prompt(
-        "second".to_string(),
-        &mut in_flight,
-        &mut queue,
-    );
+    let second =
+        enqueue_or_dispatch_master_report_prompt("second".to_string(), &mut in_flight, &mut queue);
     assert!(second.is_none());
     assert!(in_flight);
     assert_eq!(queue.len(), 1);
@@ -252,7 +335,7 @@ fn task_check_start_gate_blocks_while_docs_attach_running() {
 }
 
 #[test]
-fn master_completion_skips_task_file_processing_while_execution_is_enabled() {
+fn master_completion_skips_task_file_processing_only_while_execution_is_busy() {
     assert!(!should_process_master_task_file_updates(true));
     assert!(should_process_master_task_file_updates(false));
 }
@@ -273,6 +356,371 @@ fn task_write_baseline_is_preserved_only_while_retry_is_requested() {
     assert!(!should_clear_task_write_baseline(false, true));
     assert!(should_clear_task_write_baseline(false, false));
     assert!(should_clear_task_write_baseline(true, true));
+}
+
+#[test]
+fn reset_master_report_runtime_clears_inflight_queue_and_transcript() {
+    let mut in_flight = true;
+    let mut queue = std::collections::VecDeque::from([String::from("queued")]);
+    let mut transcript = vec![String::from("line")];
+
+    reset_master_report_runtime(&mut in_flight, &mut queue, &mut transcript);
+
+    assert!(!in_flight);
+    assert!(queue.is_empty());
+    assert!(transcript.is_empty());
+}
+
+#[test]
+fn reset_task_check_runtime_clears_state() {
+    let mut in_flight = true;
+    let mut baseline = Some("before".to_string());
+
+    reset_task_check_runtime(&mut in_flight, &mut baseline);
+
+    assert!(!in_flight);
+    assert!(baseline.is_none());
+}
+
+#[test]
+fn prepare_resumed_session_rejects_malformed_tasks_json() {
+    let (store, session_dir) = open_temp_store("resume-prepare-malformed");
+    std::fs::write(store.tasks_file(), "{ invalid json").expect("write malformed tasks.json");
+
+    let selection = ResumeSessionOption {
+        session_dir: session_dir.display().to_string(),
+        workspace: "workspace".to_string(),
+        title: None,
+        created_at_label: None,
+        last_used_epoch_secs: 0,
+    };
+    let cwd = std::env::current_dir().expect("cwd");
+    let err = prepare_resumed_session(&cwd, &selection).expect_err("prepare should fail");
+    assert!(
+        err.to_string()
+            .contains("failed to read tasks.json for resumed session")
+    );
+
+    std::fs::remove_dir_all(session_dir).ok();
+}
+
+#[test]
+fn prepare_resumed_session_rejects_invalid_task_hierarchy() {
+    let (store, session_dir) = open_temp_store("resume-prepare-invalid-shape");
+    let invalid_tasks = vec![
+        PlannerTaskFileEntry {
+            id: "top".to_string(),
+            title: "Top".to_string(),
+            details: "d".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Task,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: None,
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "impl".to_string(),
+            title: "Impl".to_string(),
+            details: "d".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Implementor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top".to_string()),
+            order: Some(0),
+        },
+    ];
+    std::fs::write(
+        store.tasks_file(),
+        serde_json::to_string_pretty(&invalid_tasks).expect("serialize invalid tasks"),
+    )
+    .expect("write invalid tasks");
+
+    let selection = ResumeSessionOption {
+        session_dir: session_dir.display().to_string(),
+        workspace: "workspace".to_string(),
+        title: None,
+        created_at_label: None,
+        last_used_epoch_secs: 0,
+    };
+    let cwd = std::env::current_dir().expect("cwd");
+    let err = prepare_resumed_session(&cwd, &selection).expect_err("prepare should fail");
+    assert!(
+        err.to_string()
+            .contains("failed to validate resumed tasks.json")
+    );
+
+    std::fs::remove_dir_all(session_dir).ok();
+}
+
+#[test]
+fn resume_session_does_not_switch_when_target_tasks_are_invalid() {
+    let (current_store, current_dir) = open_temp_store("resume-current-valid");
+    let current_tasks = vec![PlannerTaskFileEntry {
+        id: "current-task".to_string(),
+        title: "Current Task".to_string(),
+        details: "details".to_string(),
+        docs: Vec::new(),
+        kind: PlannerTaskKindFile::Task,
+        status: PlannerTaskStatusFile::Pending,
+        parent_id: None,
+        order: Some(0),
+    }];
+    std::fs::write(
+        current_store.tasks_file(),
+        serde_json::to_string_pretty(&current_tasks).expect("serialize current tasks"),
+    )
+    .expect("write current tasks");
+
+    let (target_store, target_dir) = open_temp_store("resume-target-invalid");
+    std::fs::write(target_store.tasks_file(), "{ invalid json")
+        .expect("write malformed target tasks");
+
+    let mut app = App::default();
+    app.sync_planner_tasks_from_file(current_tasks)
+        .expect("seed current task view");
+    app.set_right_pane_mode(RightPaneMode::TaskList);
+    let mut session_store = Some(current_store);
+
+    let master_adapter = CodexAdapter::new();
+    let master_report_adapter = CodexAdapter::new();
+    let project_info_adapter = CodexAdapter::new();
+    let mut worker_agent_adapters: HashMap<String, CodexAdapter> = HashMap::new();
+    let mut active_worker_context_key = None;
+    let mut pending_task_write_baseline = None;
+    let mut docs_attach_in_flight = false;
+    let mut master_session_intro_needed = false;
+    let mut master_report_session_intro_needed = false;
+    let mut pending_master_message_after_project_info = None;
+    let mut project_info_in_flight = false;
+    let mut project_info_stage = None;
+    let mut project_info_text = None;
+    let mut master_report_in_flight = true;
+    let mut pending_master_report_prompts = std::collections::VecDeque::from([String::from("x")]);
+    let mut master_report_transcript = vec![String::from("line")];
+    let mut task_check_in_flight = true;
+    let mut task_check_baseline = Some("baseline".to_string());
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+
+    let selection = ResumeSessionOption {
+        session_dir: target_dir.display().to_string(),
+        workspace: "workspace".to_string(),
+        title: None,
+        created_at_label: None,
+        last_used_epoch_secs: 0,
+    };
+    resume_session(
+        &mut app,
+        &mut session_store,
+        selection,
+        &master_adapter,
+        &master_report_adapter,
+        &project_info_adapter,
+        &mut worker_agent_adapters,
+        &mut active_worker_context_key,
+        &mut pending_task_write_baseline,
+        &mut docs_attach_in_flight,
+        &mut master_session_intro_needed,
+        &mut master_report_session_intro_needed,
+        &mut pending_master_message_after_project_info,
+        &mut project_info_in_flight,
+        &mut project_info_stage,
+        &mut project_info_text,
+        &mut master_report_in_flight,
+        &mut pending_master_report_prompts,
+        &mut master_report_transcript,
+        &mut task_check_in_flight,
+        &mut task_check_baseline,
+        &mut terminal,
+    )
+    .expect("resume should not hard-fail");
+
+    let active_session = session_store.as_ref().expect("session remains set");
+    assert_eq!(
+        active_session.session_dir(),
+        current_dir.as_path(),
+        "resume should not switch active session when target tasks are invalid"
+    );
+    assert!(
+        app.right_block_lines(80)
+            .iter()
+            .any(|line| line.contains("Current Task"))
+    );
+    let last = app
+        .left_bottom_lines()
+        .last()
+        .expect("resume failure message should be present");
+    assert!(last.contains("Failed to resume session"));
+
+    std::fs::remove_dir_all(current_dir).ok();
+    std::fs::remove_dir_all(target_dir).ok();
+}
+
+#[test]
+fn resume_session_resets_master_report_and_task_check_runtime_state_on_success() {
+    let (current_store, current_dir) = open_temp_store("resume-current-state-reset");
+    let (target_store, target_dir) = open_temp_store("resume-target-state-reset");
+    let target_tasks = vec![PlannerTaskFileEntry {
+        id: "target-task".to_string(),
+        title: "Target Task".to_string(),
+        details: "details".to_string(),
+        docs: Vec::new(),
+        kind: PlannerTaskKindFile::Task,
+        status: PlannerTaskStatusFile::Pending,
+        parent_id: None,
+        order: Some(0),
+    }];
+    std::fs::write(
+        target_store.tasks_file(),
+        serde_json::to_string_pretty(&target_tasks).expect("serialize target tasks"),
+    )
+    .expect("write target tasks");
+
+    let mut app = App::default();
+    let mut session_store = Some(current_store);
+
+    let master_adapter = CodexAdapter::new();
+    let master_report_adapter = CodexAdapter::new();
+    let project_info_adapter = CodexAdapter::new();
+    let mut worker_agent_adapters: HashMap<String, CodexAdapter> = HashMap::new();
+    let mut active_worker_context_key = None;
+    let mut pending_task_write_baseline = Some(PendingTaskWriteBaseline {
+        tasks_json: "[]".to_string(),
+    });
+    let mut docs_attach_in_flight = true;
+    let mut master_session_intro_needed = false;
+    let mut master_report_session_intro_needed = false;
+    let mut pending_master_message_after_project_info = Some("queued".to_string());
+    let mut project_info_in_flight = true;
+    let mut project_info_stage = Some(ProjectInfoStage::GatheringInfo);
+    let mut project_info_text = Some("context".to_string());
+    let mut master_report_in_flight = true;
+    let mut pending_master_report_prompts = std::collections::VecDeque::from([String::from("x")]);
+    let mut master_report_transcript = vec![String::from("line")];
+    let mut task_check_in_flight = true;
+    let mut task_check_baseline = Some("baseline".to_string());
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+
+    let selection = ResumeSessionOption {
+        session_dir: target_dir.display().to_string(),
+        workspace: "workspace".to_string(),
+        title: None,
+        created_at_label: None,
+        last_used_epoch_secs: 0,
+    };
+    resume_session(
+        &mut app,
+        &mut session_store,
+        selection,
+        &master_adapter,
+        &master_report_adapter,
+        &project_info_adapter,
+        &mut worker_agent_adapters,
+        &mut active_worker_context_key,
+        &mut pending_task_write_baseline,
+        &mut docs_attach_in_flight,
+        &mut master_session_intro_needed,
+        &mut master_report_session_intro_needed,
+        &mut pending_master_message_after_project_info,
+        &mut project_info_in_flight,
+        &mut project_info_stage,
+        &mut project_info_text,
+        &mut master_report_in_flight,
+        &mut pending_master_report_prompts,
+        &mut master_report_transcript,
+        &mut task_check_in_flight,
+        &mut task_check_baseline,
+        &mut terminal,
+    )
+    .expect("resume should succeed");
+
+    let active_session = session_store.as_ref().expect("session should be present");
+    assert_eq!(active_session.session_dir(), target_dir.as_path());
+    assert!(!master_report_in_flight);
+    assert!(pending_master_report_prompts.is_empty());
+    assert!(master_report_transcript.is_empty());
+    assert!(!task_check_in_flight);
+    assert!(task_check_baseline.is_none());
+
+    std::fs::remove_dir_all(current_dir).ok();
+    std::fs::remove_dir_all(target_dir).ok();
+}
+
+#[test]
+fn newmaster_resets_master_report_and_task_check_runtime_state() {
+    let mut app = App::default();
+    let master_adapter = CodexAdapter::new();
+    let master_report_adapter = CodexAdapter::new();
+    let project_info_adapter = CodexAdapter::new();
+    let docs_attach_adapter = CodexAdapter::new();
+    let test_runner_adapter = TestRunnerAdapter::new();
+    let model_routing = CodexAgentModelRouting::default();
+
+    let mut worker_agent_adapters: HashMap<String, CodexAdapter> = HashMap::new();
+    let mut active_worker_context_key = None;
+    let mut session_store: Option<SessionStore> = None;
+    let cwd = std::env::current_dir().expect("cwd");
+    let mut pending_task_write_baseline = Some(PendingTaskWriteBaseline {
+        tasks_json: "[]".to_string(),
+    });
+    let mut docs_attach_in_flight = true;
+    let mut master_session_intro_needed = false;
+    let mut master_report_session_intro_needed = false;
+    let mut pending_master_message_after_project_info = Some("queued".to_string());
+    let mut project_info_in_flight = true;
+    let mut project_info_stage = Some(ProjectInfoStage::GatheringInfo);
+    let mut project_info_text = Some("context".to_string());
+    let mut master_report_in_flight = true;
+    let mut pending_master_report_prompts = std::collections::VecDeque::from([String::from("x")]);
+    let mut master_report_transcript = vec![String::from("line")];
+    let mut task_check_in_flight = true;
+    let mut task_check_baseline = Some("before".to_string());
+
+    app.set_task_check_in_progress(true);
+    app.set_docs_attach_in_progress(true);
+    app.set_master_in_progress(true);
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+
+    submit_user_message(
+        &mut app,
+        "/newmaster".to_string(),
+        &master_adapter,
+        &master_report_adapter,
+        &project_info_adapter,
+        &mut worker_agent_adapters,
+        &mut active_worker_context_key,
+        &docs_attach_adapter,
+        &test_runner_adapter,
+        &mut master_report_in_flight,
+        &mut pending_master_report_prompts,
+        &mut master_report_transcript,
+        &mut task_check_in_flight,
+        &mut task_check_baseline,
+        &mut session_store,
+        &cwd,
+        &mut terminal,
+        &mut pending_task_write_baseline,
+        &mut docs_attach_in_flight,
+        &mut master_session_intro_needed,
+        &mut master_report_session_intro_needed,
+        &mut pending_master_message_after_project_info,
+        &mut project_info_in_flight,
+        &mut project_info_stage,
+        &mut project_info_text,
+        &model_routing,
+    )
+    .expect("newmaster command should succeed");
+
+    assert!(!master_report_in_flight);
+    assert!(pending_master_report_prompts.is_empty());
+    assert!(master_report_transcript.is_empty());
+    assert!(!task_check_in_flight);
+    assert!(task_check_baseline.is_none());
 }
 
 #[test]
@@ -1105,5 +1553,128 @@ fn remove_final_audit_reports_not_present_when_only_non_final_tasks_exist() {
         .expect("expected status message");
     assert_eq!(last, "System: No final audit task was present.");
 
+    std::fs::remove_dir_all(session_dir).ok();
+}
+
+#[test]
+fn final_audit_commands_do_not_write_while_execution_busy() {
+    let (store, session_dir) = open_temp_store("final-audit-block-while-running");
+    let tasks = integration_plan_with_final();
+    let tasks_json = serde_json::to_string_pretty(&tasks).expect("serialize tasks");
+    std::fs::write(store.tasks_file(), tasks_json).expect("write tasks");
+
+    let mut app = App::default();
+    app.sync_planner_tasks_from_file(tasks.clone())
+        .expect("sync tasks");
+    app.start_execution();
+    let _ = app
+        .start_next_worker_job()
+        .expect("active worker should exist");
+    assert!(app.is_execution_busy());
+
+    let before = std::fs::read_to_string(store.tasks_file()).expect("read tasks before");
+    let handled = handle_final_audit_tasks_command(&mut app, "/add-final-audit", &store)
+        .expect("command should not error");
+    assert!(handled);
+    let after = std::fs::read_to_string(store.tasks_file()).expect("read tasks after");
+    assert_eq!(after, before, "tasks.json must not be mutated while busy");
+
+    let last = app
+        .left_bottom_lines()
+        .last()
+        .expect("expected status message");
+    assert!(last.contains("Cannot modify final-audit tasks while worker execution is running"));
+
+    std::fs::remove_dir_all(session_dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn add_final_audit_reports_write_failure_without_returning_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (store, session_dir) = open_temp_store("final-audit-add-write-fail");
+    let tasks = vec![PlannerTaskFileEntry {
+        id: "task-1".to_string(),
+        title: "Task".to_string(),
+        details: "details".to_string(),
+        docs: Vec::new(),
+        kind: PlannerTaskKindFile::Task,
+        status: PlannerTaskStatusFile::Pending,
+        parent_id: None,
+        order: Some(0),
+    }];
+    let tasks_json = serde_json::to_string_pretty(&tasks).expect("serialize tasks");
+    std::fs::write(store.tasks_file(), tasks_json).expect("write tasks");
+    let before = std::fs::read_to_string(store.tasks_file()).expect("read tasks before");
+
+    let mut perms = std::fs::metadata(store.tasks_file())
+        .expect("metadata")
+        .permissions();
+    perms.set_mode(0o444);
+    std::fs::set_permissions(store.tasks_file(), perms).expect("set readonly");
+
+    let mut app = App::default();
+    let handled = handle_final_audit_tasks_command(&mut app, "/add-final-audit", &store)
+        .expect("command should not error");
+    assert!(handled);
+
+    let after = std::fs::read_to_string(store.tasks_file()).expect("read tasks after");
+    assert_eq!(
+        after, before,
+        "tasks.json should stay unchanged when write fails"
+    );
+    let last = app
+        .left_bottom_lines()
+        .last()
+        .expect("expected status message");
+    assert!(last.contains("Failed to write tasks file while adding final audit task"));
+
+    let mut reset_perms = std::fs::metadata(store.tasks_file())
+        .expect("metadata")
+        .permissions();
+    reset_perms.set_mode(0o644);
+    let _ = std::fs::set_permissions(store.tasks_file(), reset_perms);
+    std::fs::remove_dir_all(session_dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_final_audit_reports_write_failure_without_returning_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (store, session_dir) = open_temp_store("final-audit-remove-write-fail");
+    let tasks = integration_plan_with_final();
+    let tasks_json = serde_json::to_string_pretty(&tasks).expect("serialize tasks");
+    std::fs::write(store.tasks_file(), tasks_json).expect("write tasks");
+    let before = std::fs::read_to_string(store.tasks_file()).expect("read tasks before");
+
+    let mut perms = std::fs::metadata(store.tasks_file())
+        .expect("metadata")
+        .permissions();
+    perms.set_mode(0o444);
+    std::fs::set_permissions(store.tasks_file(), perms).expect("set readonly");
+
+    let mut app = App::default();
+    let handled = handle_final_audit_tasks_command(&mut app, "/remove-final-audit", &store)
+        .expect("command should not error");
+    assert!(handled);
+
+    let after = std::fs::read_to_string(store.tasks_file()).expect("read tasks after");
+    assert_eq!(
+        after, before,
+        "tasks.json should stay unchanged when write fails"
+    );
+    let last = app
+        .left_bottom_lines()
+        .last()
+        .expect("expected status message");
+    assert!(last.contains("Failed to write tasks file while removing final audit task"));
+
+    let mut reset_perms = std::fs::metadata(store.tasks_file())
+        .expect("metadata")
+        .permissions();
+    reset_perms.set_mode(0o644);
+    let _ = std::fs::set_permissions(store.tasks_file(), reset_perms);
     std::fs::remove_dir_all(session_dir).ok();
 }

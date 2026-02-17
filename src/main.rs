@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -55,6 +55,7 @@ enum SubmitBlockReason {
     ProjectInfoGathering,
     MasterBusy,
     TaskCheck,
+    ExecutionBusy,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +294,11 @@ fn run_app(
             &mut active_worker_context_key,
             &docs_attach_adapter,
             &test_runner_adapter,
+            &mut master_report_in_flight,
+            &mut pending_master_report_prompts,
+            &mut master_report_transcript,
+            &mut task_check_in_flight,
+            &mut task_check_baseline,
             &mut session_store,
             &cwd,
             terminal,
@@ -336,7 +342,7 @@ fn run_app(
                         .map(|b| b.tasks_json.clone());
                     let mut tasks_refresh_ok = false;
                     let mut requested_task_file_retry = false;
-                    if should_process_master_task_file_updates(app.is_execution_enabled()) {
+                    if should_process_master_task_file_updates(app.is_execution_busy()) {
                         match active_session.read_tasks() {
                             Ok(mut tasks) => {
                                 let docs_sanitized = sanitize_master_docs_fields(
@@ -492,6 +498,21 @@ fn run_app(
                         chat_updated = true;
                         continue;
                     };
+                    if let Some(key) = active_worker_context_key.as_ref()
+                        && let Some(adapter) = worker_agent_adapters.get(key)
+                    {
+                        for tail_event in drain_post_completion_worker_events(adapter) {
+                            match tail_event {
+                                AgentEvent::Output(line) => {
+                                    app.on_worker_output(line);
+                                }
+                                AgentEvent::System(line) => {
+                                    app.on_worker_system_output(line);
+                                }
+                                AgentEvent::Completed { .. } => {}
+                            }
+                        }
+                    }
                     active_worker_context_key = None;
                     let new_context_entries = app.on_worker_completed(success, code);
                     let exhausted_failures = app.drain_worker_failures();
@@ -1012,10 +1033,13 @@ fn run_app(
                             &mut project_info_in_flight,
                             &mut project_info_stage,
                             &mut project_info_text,
+                            &mut master_report_in_flight,
+                            &mut pending_master_report_prompts,
+                            &mut master_report_transcript,
+                            &mut task_check_in_flight,
+                            &mut task_check_baseline,
                             terminal,
                         )?;
-                        task_check_in_flight = false;
-                        task_check_baseline = None;
                     }
                 } else if app.active_pane == Pane::LeftBottom {
                     app.input_char(c);
@@ -1050,13 +1074,13 @@ fn run_app(
                             &mut project_info_in_flight,
                             &mut project_info_stage,
                             &mut project_info_text,
+                            &mut master_report_in_flight,
+                            &mut pending_master_report_prompts,
+                            &mut master_report_transcript,
+                            &mut task_check_in_flight,
+                            &mut task_check_baseline,
                             terminal,
                         )?;
-                        master_report_in_flight = false;
-                        pending_master_report_prompts.clear();
-                        master_report_transcript.clear();
-                        task_check_in_flight = false;
-                        task_check_baseline = None;
                     }
                 } else if app.active_pane == Pane::LeftBottom {
                     let pending = app.chat_input().trim().to_string();
@@ -1064,6 +1088,7 @@ fn run_app(
                         project_info_in_flight,
                         app.is_master_in_progress(),
                         app.is_task_check_in_progress(),
+                        app.is_execution_busy(),
                         &pending,
                     ) {
                         Some(SubmitBlockReason::ProjectInfoGathering) => {
@@ -1084,6 +1109,13 @@ fn run_app(
                             );
                             continue;
                         }
+                        Some(SubmitBlockReason::ExecutionBusy) => {
+                            app.push_agent_message(
+                                "System: Execution is currently running. Master/task editing commands are blocked until active worker jobs finish."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
                         None => {}
                     }
                     if parse_silent_master_command(&pending).is_some()
@@ -1101,6 +1133,11 @@ fn run_app(
                                 &mut active_worker_context_key,
                                 &docs_attach_adapter,
                                 &test_runner_adapter,
+                                &mut master_report_in_flight,
+                                &mut pending_master_report_prompts,
+                                &mut master_report_transcript,
+                                &mut task_check_in_flight,
+                                &mut task_check_baseline,
                                 &mut session_store,
                                 &cwd,
                                 terminal,
@@ -1126,6 +1163,11 @@ fn run_app(
                             &mut active_worker_context_key,
                             &docs_attach_adapter,
                             &test_runner_adapter,
+                            &mut master_report_in_flight,
+                            &mut pending_master_report_prompts,
+                            &mut master_report_transcript,
+                            &mut task_check_in_flight,
+                            &mut task_check_baseline,
                             &mut session_store,
                             &cwd,
                             terminal,
@@ -1190,7 +1232,7 @@ fn run_app(
     Ok(())
 }
 
-fn submit_user_message(
+fn submit_user_message<B: Backend>(
     app: &mut App,
     message: String,
     master_adapter: &CodexAdapter,
@@ -1200,9 +1242,14 @@ fn submit_user_message(
     active_worker_context_key: &mut Option<String>,
     docs_attach_adapter: &CodexAdapter,
     test_runner_adapter: &TestRunnerAdapter,
+    master_report_in_flight: &mut bool,
+    pending_master_report_prompts: &mut VecDeque<String>,
+    master_report_transcript: &mut Vec<String>,
+    task_check_in_flight: &mut bool,
+    task_check_baseline: &mut Option<String>,
     session_store: &mut Option<SessionStore>,
     cwd: &Path,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<B>,
     pending_task_write_baseline: &mut Option<PendingTaskWriteBaseline>,
     docs_attach_in_flight: &mut bool,
     master_session_intro_needed: &mut bool,
@@ -1230,6 +1277,18 @@ fn submit_user_message(
     if command_requires_active_session(&message) && session_store.is_none() {
         app.push_agent_message(
             "System: No active session yet. Enter a normal message to start one, or use /resume to select an existing session."
+                .to_string(),
+        );
+        let size = terminal.size()?;
+        let screen = Rect::new(0, 0, size.width, size.height);
+        let max_scroll = ui::chat_max_scroll(screen, app);
+        app.set_chat_scroll(max_scroll);
+        return Ok(());
+    }
+
+    if app.is_execution_busy() && conflicts_with_running_execution(&message) {
+        app.push_agent_message(
+            "System: Execution is currently running. Master/task editing commands are blocked until active worker jobs finish."
                 .to_string(),
         );
         let size = terminal.size()?;
@@ -1267,16 +1326,39 @@ fn submit_user_message(
     }
 
     if App::is_new_master_command(&message) {
+        if app.is_execution_busy() {
+            app.push_agent_message(
+                "System: Cannot start a new master session while worker execution is running. Wait for active jobs to finish first."
+                    .to_string(),
+            );
+            let size = terminal.size()?;
+            let screen = Rect::new(0, 0, size.width, size.height);
+            let max_scroll = ui::chat_max_scroll(screen, app);
+            app.set_chat_scroll(max_scroll);
+            return Ok(());
+        }
         master_adapter.reset_session();
         master_report_adapter.reset_session();
         project_info_adapter.reset_session();
         worker_agent_adapters.clear();
         *active_worker_context_key = None;
+        *pending_task_write_baseline = None;
         *master_session_intro_needed = true;
         *master_report_session_intro_needed = true;
         *project_info_stage = None;
         *project_info_in_flight = false;
+        *pending_master_message_after_project_info = None;
+        *docs_attach_in_flight = false;
+        reset_master_report_runtime(
+            master_report_in_flight,
+            pending_master_report_prompts,
+            master_report_transcript,
+        );
+        reset_task_check_runtime(task_check_in_flight, task_check_baseline);
+        app.set_docs_attach_in_progress(false);
+        app.set_task_check_in_progress(false);
         app.set_master_in_progress(false);
+        app.reset_execution_for_session_switch();
         app.push_agent_message("System: Started new master session".to_string());
         let size = terminal.size()?;
         let screen = Rect::new(0, 0, size.width, size.height);
@@ -1527,8 +1609,54 @@ fn resumed_right_pane_mode(tasks: &[PlannerTaskFileEntry]) -> RightPaneMode {
     }
 }
 
+#[derive(Debug)]
+struct PreparedResumeSession {
+    store: SessionStore,
+    tasks: Vec<PlannerTaskFileEntry>,
+    pane_mode: RightPaneMode,
+    planner_markdown: String,
+    rolling_context: Vec<String>,
+    project_info_text: Option<String>,
+}
+
+fn prepare_resumed_session(
+    cwd: &Path,
+    selection: &ResumeSessionOption,
+) -> io::Result<PreparedResumeSession> {
+    let selected_path = PathBuf::from(&selection.session_dir);
+    let store = SessionStore::open_existing(cwd, &selected_path)?;
+    let tasks = store.read_tasks().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to read tasks.json for resumed session: {err}"),
+        )
+    })?;
+    let mut validator = workflow::Workflow::default();
+    validator
+        .sync_planner_tasks_from_file(tasks.clone())
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to validate resumed tasks.json: {err}"),
+            )
+        })?;
+
+    Ok(PreparedResumeSession {
+        pane_mode: resumed_right_pane_mode(&tasks),
+        planner_markdown: store.read_planner_markdown().unwrap_or_default(),
+        rolling_context: store.read_rolling_context().unwrap_or_default(),
+        project_info_text: store
+            .read_project_info()
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        store,
+        tasks,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn resume_session(
+fn resume_session<B: Backend>(
     app: &mut App,
     session_store: &mut Option<SessionStore>,
     selection: ResumeSessionOption,
@@ -1545,12 +1673,30 @@ fn resume_session(
     project_info_in_flight: &mut bool,
     project_info_stage: &mut Option<ProjectInfoStage>,
     project_info_text: &mut Option<String>,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    master_report_in_flight: &mut bool,
+    pending_master_report_prompts: &mut VecDeque<String>,
+    master_report_transcript: &mut Vec<String>,
+    task_check_in_flight: &mut bool,
+    task_check_baseline: &mut Option<String>,
+    terminal: &mut Terminal<B>,
 ) -> io::Result<()> {
     let cwd = std::env::current_dir()?;
-    let selected_path = PathBuf::from(&selection.session_dir);
-    let resumed = SessionStore::open_existing(&cwd, &selected_path)?;
-    *session_store = Some(resumed);
+    let prepared = match prepare_resumed_session(&cwd, &selection) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            app.push_agent_message(format!(
+                "System: Failed to resume session {}: {err}",
+                selection.session_dir
+            ));
+            let size = terminal.size()?;
+            let screen = Rect::new(0, 0, size.width, size.height);
+            let max_scroll = ui::chat_max_scroll(screen, app);
+            app.set_chat_scroll(max_scroll);
+            return Ok(());
+        }
+    };
+
+    *session_store = Some(prepared.store);
     let active_session = session_store
         .as_ref()
         .expect("resumed session should be available");
@@ -1567,38 +1713,31 @@ fn resume_session(
     *docs_attach_in_flight = false;
     *project_info_in_flight = false;
     *project_info_stage = None;
+    reset_master_report_runtime(
+        master_report_in_flight,
+        pending_master_report_prompts,
+        master_report_transcript,
+    );
+    reset_task_check_runtime(task_check_in_flight, task_check_baseline);
 
     app.reset_execution_for_session_switch();
     app.set_task_check_in_progress(false);
     app.set_docs_attach_in_progress(false);
     app.set_master_in_progress(false);
 
-    let rolling = active_session.read_rolling_context().unwrap_or_default();
-    app.replace_rolling_context_entries(rolling);
+    app.replace_rolling_context_entries(prepared.rolling_context);
 
-    match active_session.read_tasks() {
-        Ok(tasks) => {
-            let pane_mode = resumed_right_pane_mode(&tasks);
-            match app.sync_planner_tasks_from_file(tasks) {
-                Ok(()) => {
-                    app.set_right_pane_mode(pane_mode);
-                }
-                Err(err) => app.push_agent_message(format!(
-                    "System: Failed to refresh task tree from resumed tasks.json: {err}"
-                )),
-            }
+    match app.sync_planner_tasks_from_file(prepared.tasks) {
+        Ok(()) => {
+            app.set_right_pane_mode(prepared.pane_mode);
         }
-        Err(err) => app.push_agent_message(format!("System: Failed to read tasks.json: {err}")),
+        Err(err) => app.push_agent_message(format!(
+            "System: Failed to refresh task tree from resumed tasks.json: {err}"
+        )),
     }
-    if let Ok(markdown) = active_session.read_planner_markdown() {
-        app.set_planner_markdown(markdown);
-    }
+    app.set_planner_markdown(prepared.planner_markdown);
 
-    *project_info_text = active_session
-        .read_project_info()
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    *project_info_text = prepared.project_info_text;
 
     app.push_agent_message(format!(
         "System: Resumed session {}",
@@ -1633,11 +1772,11 @@ fn build_resume_options(
         .collect()
 }
 
-fn handle_final_audit_command(
+fn handle_final_audit_command<B: Backend>(
     app: &mut App,
     message: &str,
     session_store: &SessionStore,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<B>,
 ) -> io::Result<bool> {
     if handle_final_audit_tasks_command(app, message, session_store)? {
         let size = terminal.size()?;
@@ -1654,6 +1793,16 @@ fn handle_final_audit_tasks_command(
     message: &str,
     session_store: &SessionStore,
 ) -> io::Result<bool> {
+    if (App::is_add_final_audit_command(message) || App::is_remove_final_audit_command(message))
+        && app.is_execution_busy()
+    {
+        app.push_agent_message(
+            "System: Cannot modify final-audit tasks while worker execution is running. Wait for active jobs to finish first."
+                .to_string(),
+        );
+        return Ok(true);
+    }
+
     if App::is_add_final_audit_command(message) {
         let mut tasks = match session_store.read_tasks() {
             Ok(tasks) => tasks,
@@ -1666,12 +1815,18 @@ fn handle_final_audit_tasks_command(
         };
         ensure_final_audit_task(&mut tasks);
         normalize_root_orders_with_final_last(&mut tasks);
-        let text = serde_json::to_string_pretty(&tasks).map_err(io::Error::other)?;
-        std::fs::write(session_store.tasks_file(), text)?;
-        match app.sync_planner_tasks_from_file(tasks) {
-            Ok(_) => app.push_agent_message("System: Added final audit task.".to_string()),
+        match app.sync_planner_tasks_from_file(tasks.clone()) {
+            Ok(_) => match serde_json::to_string_pretty(&tasks)
+                .map_err(io::Error::other)
+                .and_then(|text| std::fs::write(session_store.tasks_file(), text))
+            {
+                Ok(()) => app.push_agent_message("System: Added final audit task.".to_string()),
+                Err(err) => app.push_agent_message(format!(
+                    "System: Failed to write tasks file while adding final audit task: {err}"
+                )),
+            },
             Err(err) => app.push_agent_message(format!(
-                "System: Final audit task was written, but refresh failed: {err}"
+                "System: Final audit command aborted; task tree refresh failed before write: {err}"
             )),
         }
         return Ok(true);
@@ -1693,18 +1848,26 @@ fn handle_final_audit_tasks_command(
             .count();
         tasks.retain(|task| task.kind != PlannerTaskKindFile::FinalAudit);
         normalize_root_orders_with_final_last(&mut tasks);
-        let text = serde_json::to_string_pretty(&tasks).map_err(io::Error::other)?;
-        std::fs::write(session_store.tasks_file(), text)?;
-        match app.sync_planner_tasks_from_file(tasks) {
-            Ok(_) => {
-                if final_audit_count == 0 {
-                    app.push_agent_message("System: No final audit task was present.".to_string());
-                } else {
-                    app.push_agent_message("System: Removed final audit task.".to_string());
+        match app.sync_planner_tasks_from_file(tasks.clone()) {
+            Ok(_) => match serde_json::to_string_pretty(&tasks)
+                .map_err(io::Error::other)
+                .and_then(|text| std::fs::write(session_store.tasks_file(), text))
+            {
+                Ok(()) => {
+                    if final_audit_count == 0 {
+                        app.push_agent_message(
+                            "System: No final audit task was present.".to_string(),
+                        );
+                    } else {
+                        app.push_agent_message("System: Removed final audit task.".to_string());
+                    }
                 }
-            }
+                Err(err) => app.push_agent_message(format!(
+                    "System: Failed to write tasks file while removing final audit task: {err}"
+                )),
+            },
             Err(err) => app.push_agent_message(format!(
-                "System: Final audit removal was written, but refresh failed: {err}"
+                "System: Final audit command aborted; task tree refresh failed before write: {err}"
             )),
         }
         return Ok(true);
@@ -1886,6 +2049,24 @@ fn should_clear_task_write_baseline(
     tasks_refresh_ok || !requested_task_file_retry
 }
 
+fn reset_master_report_runtime(
+    master_report_in_flight: &mut bool,
+    pending_master_report_prompts: &mut VecDeque<String>,
+    master_report_transcript: &mut Vec<String>,
+) {
+    *master_report_in_flight = false;
+    pending_master_report_prompts.clear();
+    master_report_transcript.clear();
+}
+
+fn reset_task_check_runtime(
+    task_check_in_flight: &mut bool,
+    task_check_baseline: &mut Option<String>,
+) {
+    *task_check_in_flight = false;
+    *task_check_baseline = None;
+}
+
 fn scroll_right_up_global(app: &mut App) {
     for _ in 0..GLOBAL_RIGHT_SCROLL_LINES {
         app.scroll_right_up();
@@ -1900,7 +2081,7 @@ fn scroll_right_down_global(app: &mut App, max_scroll: u16) {
 
 fn should_send_to_master(message: &str) -> bool {
     let trimmed = message.trim();
-    !trimmed.starts_with('/')
+    !trimmed.starts_with('/') && !App::is_start_execution_command(trimmed)
 }
 
 fn should_initialize_session_for_message(message: &str) -> bool {
@@ -1963,10 +2144,22 @@ fn is_allowed_during_task_check(message: &str) -> bool {
     App::is_quit_command(message)
 }
 
+fn conflicts_with_running_execution(message: &str) -> bool {
+    should_send_to_master(message)
+        || App::is_new_master_command(message)
+        || App::is_resume_command(message)
+        || App::is_convert_command(message)
+        || App::is_attach_docs_command(message)
+        || parse_silent_master_command(message).is_some()
+        || App::is_add_final_audit_command(message)
+        || App::is_remove_final_audit_command(message)
+}
+
 fn submit_block_reason(
     project_info_in_flight: bool,
     master_in_progress: bool,
     task_check_in_progress: bool,
+    execution_busy: bool,
     message: &str,
 ) -> Option<SubmitBlockReason> {
     if project_info_in_flight {
@@ -1977,6 +2170,9 @@ fn submit_block_reason(
     }
     if task_check_in_progress && !is_allowed_during_task_check(message) {
         return Some(SubmitBlockReason::TaskCheck);
+    }
+    if execution_busy && conflicts_with_running_execution(message) {
+        return Some(SubmitBlockReason::ExecutionBusy);
     }
     None
 }
@@ -2016,8 +2212,29 @@ fn should_start_task_check(
     changed_tasks && !task_check_in_flight && !docs_attach_in_flight
 }
 
-fn should_process_master_task_file_updates(execution_enabled: bool) -> bool {
-    !execution_enabled
+fn drain_post_completion_worker_events(adapter: &CodexAdapter) -> Vec<AgentEvent> {
+    const MAX_TAIL_POLLS: usize = 24;
+    const MAX_IDLE_POLLS: usize = 8;
+    let mut out = Vec::new();
+    let mut idle_polls = 0usize;
+    for _ in 0..MAX_TAIL_POLLS {
+        let batch = adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP);
+        if batch.is_empty() {
+            idle_polls = idle_polls.saturating_add(1);
+            if idle_polls >= MAX_IDLE_POLLS {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        idle_polls = 0;
+        out.extend(batch);
+    }
+    out
+}
+
+fn should_process_master_task_file_updates(execution_busy: bool) -> bool {
+    !execution_busy
 }
 
 fn parse_silent_master_command(message: &str) -> Option<SilentMasterCommand> {
@@ -2037,12 +2254,12 @@ fn parse_silent_master_command(message: &str) -> Option<SilentMasterCommand> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_silent_master_command(
+fn handle_silent_master_command<B: Backend>(
     app: &mut App,
     message: &str,
     master_adapter: &CodexAdapter,
     session_store: &SessionStore,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<B>,
     pending_task_write_baseline: &mut Option<PendingTaskWriteBaseline>,
     master_session_intro_needed: &mut bool,
     project_info_text: Option<&str>,

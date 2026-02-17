@@ -315,8 +315,14 @@ impl Workflow {
         &mut self,
         entries: Vec<PlannerTaskFileEntry>,
     ) -> Result<usize, String> {
-        if self.execution_enabled {
+        let execution_busy = self.active.is_some() || !self.queue.is_empty();
+        if self.execution_enabled && execution_busy {
             return Err("Cannot reload planner tasks while execution is enabled".to_string());
+        }
+        if self.execution_enabled {
+            // If execution was enabled but no worker is active/queued, switch back to planning
+            // mode so task reloads can proceed.
+            self.reset_execution_runtime();
         }
 
         let mut id_to_num = std::collections::HashMap::<String, u64>::new();
@@ -467,6 +473,10 @@ impl Workflow {
 
     pub fn execution_enabled(&self) -> bool {
         self.execution_enabled
+    }
+
+    pub fn execution_busy(&self) -> bool {
+        self.execution_enabled && (self.active.is_some() || !self.queue.is_empty())
     }
 
     pub fn start_next_job(&mut self) -> Option<StartedJob> {
@@ -981,7 +991,7 @@ impl Workflow {
                 id,
                 external_id: None,
                 title: title.to_string(),
-                details: String::new(),
+                details: default_generated_details(kind).to_string(),
                 docs: Vec::new(),
                 status: TaskStatus::Pending,
                 kind,
@@ -1011,7 +1021,7 @@ impl Workflow {
                 id,
                 external_id: None,
                 title: title.to_string(),
-                details: String::new(),
+                details: default_generated_details(kind).to_string(),
                 docs: Vec::new(),
                 status: TaskStatus::Pending,
                 kind,
@@ -1721,11 +1731,42 @@ fn validate_required_subtask_structure(nodes: &[TaskNode]) -> Result<(), String>
                     ));
                 }
             }
+            let test_runner_count = node
+                .children
+                .iter()
+                .filter(|child| child.kind == TaskKind::TestRunner)
+                .count();
+            if test_runner_count > 1 {
+                return Err(format!(
+                    "Implementor task \"{}\" must include at most one test_runner subtask",
+                    node_label(node)
+                ));
+            }
         }
 
         if node.kind == TaskKind::TestWriter && parent_kind != Some(TaskKind::Top) {
             return Err(format!(
                 "Test-writer task \"{}\" must be a direct child of a top-level task (no nested test_writer groups)",
+                node_label(node)
+            ));
+        }
+
+        if node.kind == TaskKind::Auditor
+            && parent_kind != Some(TaskKind::Implementor)
+            && parent_kind != Some(TaskKind::TestWriter)
+        {
+            return Err(format!(
+                "Auditor task \"{}\" must be a child of implementor or test_writer",
+                node_label(node)
+            ));
+        }
+
+        if node.kind == TaskKind::TestRunner
+            && parent_kind != Some(TaskKind::Implementor)
+            && parent_kind != Some(TaskKind::TestWriter)
+        {
+            return Err(format!(
+                "Test-runner task \"{}\" must be a child of implementor or test_writer",
                 node_label(node)
             ));
         }
@@ -1740,6 +1781,19 @@ fn validate_required_subtask_structure(nodes: &[TaskNode]) -> Result<(), String>
                 "Test-writer task \"{}\" must include at least one test_runner subtask",
                 node_label(node)
             ));
+        }
+        if node.kind == TaskKind::TestWriter {
+            let test_runner_count = node
+                .children
+                .iter()
+                .filter(|child| child.kind == TaskKind::TestRunner)
+                .count();
+            if test_runner_count > 1 {
+                return Err(format!(
+                    "Test-writer task \"{}\" must include at most one test_runner subtask",
+                    node_label(node)
+                ));
+            }
         }
 
         for child in &node.children {
@@ -2082,9 +2136,27 @@ fn parse_audit_result_token(transcript: &[String]) -> Option<bool> {
         if upper == "AUDIT_RESULT: FAIL" {
             return Some(false);
         }
-        return None;
     }
     None
+}
+
+fn default_generated_details(kind: TaskKind) -> &'static str {
+    match kind {
+        TaskKind::Implementor => "Implement the required code changes for this top-level task.",
+        TaskKind::Auditor => {
+            "Audit implementation and tests for correctness, regressions, and completeness."
+        }
+        TaskKind::TestWriter => {
+            "Write or update tests that validate the intended behavior and regressions."
+        }
+        TaskKind::TestRunner => {
+            "Run deterministic tests and report pass/fail outcomes for this task branch."
+        }
+        TaskKind::FinalAudit => {
+            "Perform a final cross-task audit after all implementation and testing complete."
+        }
+        TaskKind::Top => "Top-level task scope and expected outcome.",
+    }
 }
 
 fn audit_feedback(transcript: &[String], code: i32, success: bool) -> String {

@@ -438,6 +438,10 @@ impl App {
         self.workflow.execution_enabled()
     }
 
+    pub fn is_execution_busy(&self) -> bool {
+        self.workflow.execution_busy()
+    }
+
     pub fn start_next_worker_job(&mut self) -> Option<StartedJob> {
         let started = self.workflow.start_next_job();
         if started.is_some() {

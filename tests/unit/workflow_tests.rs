@@ -1237,6 +1237,15 @@ fn audit_result_token_fail_overrides_no_issues_phrase() {
 }
 
 #[test]
+fn audit_result_token_is_detected_even_after_preamble_lines() {
+    assert!(!audit_detects_issues(&[
+        "Summary of findings".to_string(),
+        "AUDIT_RESULT: PASS".to_string(),
+        "Issue: wording only".to_string(),
+    ]));
+}
+
+#[test]
 fn missing_audit_result_token_falls_back_to_heuristics() {
     assert!(audit_detects_issues(&[
         "Issue: edge case missing".to_string()
@@ -1516,6 +1525,88 @@ fn sync_rejects_tasks_missing_details() {
 }
 
 #[test]
+fn sync_rejects_reload_while_execution_has_active_or_queued_work() {
+    let mut wf = Workflow::default();
+    seed_single_default_task(&mut wf, "Do work");
+    wf.start_execution();
+    assert!(wf.execution_busy());
+
+    let err = wf
+        .sync_planner_tasks_from_file(vec![PlannerTaskFileEntry {
+            id: "new-top".to_string(),
+            title: "New top".to_string(),
+            details: "details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Task,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: None,
+            order: Some(0),
+        }])
+        .expect_err("reload should be blocked while execution is busy");
+    assert!(err.contains("Cannot reload planner tasks while execution is enabled"));
+}
+
+#[test]
+fn sync_allows_reload_when_execution_is_enabled_but_idle() {
+    let mut wf = Workflow::default();
+    wf.start_execution();
+    assert!(wf.execution_enabled());
+    assert!(!wf.execution_busy());
+
+    let count = wf
+        .sync_planner_tasks_from_file(vec![PlannerTaskFileEntry {
+            id: "top".to_string(),
+            title: "Task".to_string(),
+            details: "details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Task,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: None,
+            order: Some(0),
+        }])
+        .expect("reload should succeed when execution is idle");
+    assert_eq!(count, 1);
+    assert!(!wf.execution_enabled());
+}
+
+#[test]
+fn auto_generated_subtasks_include_non_empty_details_for_reload() {
+    let mut wf = Workflow::default();
+    wf.sync_planner_tasks_from_file(vec![PlannerTaskFileEntry {
+        id: "top".to_string(),
+        title: "Top task".to_string(),
+        details: "top details".to_string(),
+        docs: Vec::new(),
+        kind: PlannerTaskKindFile::Task,
+        status: PlannerTaskStatusFile::Pending,
+        parent_id: None,
+        order: Some(0),
+    }])
+    .expect("seed plan should sync");
+
+    wf.start_execution();
+    let _ = wf.start_next_job().expect("implementor should start");
+    wf.append_active_output("implemented".to_string());
+    wf.finish_active_job(true, 0);
+
+    let _ = wf.start_next_job().expect("test writer should start");
+    wf.append_active_output("tests written".to_string());
+    wf.finish_active_job(true, 0);
+
+    let snapshot = wf.planner_tasks_for_file();
+    assert!(
+        snapshot
+            .iter()
+            .all(|entry| !entry.details.trim().is_empty())
+    );
+
+    let mut reloaded = Workflow::default();
+    reloaded
+        .sync_planner_tasks_from_file(snapshot)
+        .expect("snapshot should be reloadable");
+}
+
+#[test]
 fn sync_rejects_implementor_without_auditor() {
     let mut wf = Workflow::default();
     let err = wf
@@ -1723,6 +1814,240 @@ fn sync_rejects_nested_test_writer_groups() {
         ])
         .expect_err("should reject nested test writer grouping");
     assert!(err.contains("must be a direct child of a top-level task"));
+}
+
+#[test]
+fn sync_rejects_auditor_with_invalid_parent_kind() {
+    let mut wf = Workflow::default();
+    let err = wf
+        .sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "top".to_string(),
+                title: "Top".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl".to_string(),
+                title: "Impl".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Implementor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-audit".to_string(),
+                title: "Impl Audit".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "orphan-audit".to_string(),
+                title: "Orphan Audit".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(1),
+            },
+        ])
+        .expect_err("should reject auditor parent kind");
+    assert!(err.contains("Auditor task"));
+    assert!(err.contains("child of implementor or test_writer"));
+}
+
+#[test]
+fn sync_rejects_test_runner_with_invalid_parent_kind() {
+    let mut wf = Workflow::default();
+    let err = wf
+        .sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "top".to_string(),
+                title: "Top".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl".to_string(),
+                title: "Impl".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Implementor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-audit".to_string(),
+                title: "Impl Audit".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "orphan-runner".to_string(),
+                title: "Orphan Runner".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestRunner,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(1),
+            },
+        ])
+        .expect_err("should reject test-runner parent kind");
+    assert!(err.contains("Test-runner task"));
+    assert!(err.contains("child of implementor or test_writer"));
+}
+
+#[test]
+fn sync_rejects_multiple_test_runners_under_implementor() {
+    let mut wf = Workflow::default();
+    let err = wf
+        .sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "top".to_string(),
+                title: "Top".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl".to_string(),
+                title: "Impl".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Implementor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-audit".to_string(),
+                title: "Impl Audit".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-runner-1".to_string(),
+                title: "Runner 1".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestRunner,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(1),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-runner-2".to_string(),
+                title: "Runner 2".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestRunner,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(2),
+            },
+        ])
+        .expect_err("should reject multiple implementor test runners");
+    assert!(err.contains("Implementor task"));
+    assert!(err.contains("at most one test_runner"));
+}
+
+#[test]
+fn sync_rejects_multiple_test_runners_under_test_writer() {
+    let mut wf = Workflow::default();
+    let err = wf
+        .sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "top".to_string(),
+                title: "Top".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl".to_string(),
+                title: "Impl".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Implementor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-audit".to_string(),
+                title: "Impl Audit".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "tw".to_string(),
+                title: "Tests".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestWriter,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(1),
+            },
+            PlannerTaskFileEntry {
+                id: "tw-runner-1".to_string(),
+                title: "Runner 1".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestRunner,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("tw".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "tw-runner-2".to_string(),
+                title: "Runner 2".to_string(),
+                details: "d".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestRunner,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("tw".to_string()),
+                order: Some(1),
+            },
+        ])
+        .expect_err("should reject multiple test-writer test runners");
+    assert!(err.contains("Test-writer task"));
+    assert!(err.contains("at most one test_runner"));
 }
 
 #[test]
@@ -2318,6 +2643,26 @@ fn right_pane_shows_docs_badge_for_non_test_runner_only() {
             order: Some(0),
         },
         PlannerTaskFileEntry {
+            id: "impl".to_string(),
+            title: "Implementation".to_string(),
+            details: "Implement".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Implementor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("task".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "impl-audit".to_string(),
+            title: "Audit".to_string(),
+            details: "Audit implementation".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Auditor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("impl".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
             id: "runner".to_string(),
             title: "Runner".to_string(),
             details: "Runner details".to_string(),
@@ -2328,8 +2673,8 @@ fn right_pane_shows_docs_badge_for_non_test_runner_only() {
             }],
             kind: PlannerTaskKindFile::TestRunner,
             status: PlannerTaskStatusFile::Pending,
-            parent_id: Some("task".to_string()),
-            order: Some(0),
+            parent_id: Some("impl".to_string()),
+            order: Some(1),
         },
     ])
     .expect("sync should succeed");
