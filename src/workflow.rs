@@ -1,5 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 
+mod implementor;
+mod implementation_auditor;
+mod test_auditor;
+mod test_runner;
+mod test_writer;
+
 use crate::session_store::{
     PlannerTaskDocFileEntry, PlannerTaskFileEntry, PlannerTaskKindFile, PlannerTaskStatusFile,
 };
@@ -509,73 +515,18 @@ impl Workflow {
                 resume_audit_pass,
                 ..
             } => {
-                self.push_context(make_context_summary(
-                    "Implementor",
-                    &self.task_title(job.top_task_id),
+                implementor::on_completion(
+                    self,
+                    job.top_task_id,
+                    implementor_id,
+                    pass,
+                    resume_auditor_id,
+                    resume_audit_pass,
                     &transcript,
                     success,
-                ));
-
-                if success {
-                    // Mark implementation pass complete before moving into audit. If an audit fails,
-                    // status is set back to NeedsChanges and implementor retries.
-                    self.set_status(implementor_id, TaskStatus::Done);
-                    if let Some(auditor_id) = resume_auditor_id {
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::Auditor {
-                                implementor_id,
-                                auditor_id,
-                                pass: resume_audit_pass.unwrap_or(1),
-                                implementation_report: Some(transcript.join("\n")),
-                                changed_files_summary: Some(extract_changed_files_summary(
-                                    &transcript,
-                                )),
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} implementation pass {} complete; resumed audit queued.",
-                            job.top_task_id, pass
-                        ));
-                    } else {
-                        if self
-                            .find_child_kind(implementor_id, TaskKind::Auditor)
-                            .is_none()
-                        {
-                            let _ = self.find_or_create_child_kind(
-                                implementor_id,
-                                TaskKind::Auditor,
-                                "Audit",
-                            );
-                        }
-                        let _ = self.queue_next_implementor_audit(
-                            job.top_task_id,
-                            implementor_id,
-                            pass,
-                            Some(transcript.join("\n")),
-                            Some(extract_changed_files_summary(&transcript)),
-                            &mut messages,
-                        );
-                    }
-                } else {
-                    self.set_status(implementor_id, TaskStatus::NeedsChanges);
-                    self.queue.push_back(WorkerJob {
-                        top_task_id: job.top_task_id,
-                        kind: WorkerJobKind::Implementor {
-                            implementor_id,
-                            pass: pass.saturating_add(1),
-                            feedback: Some(format!(
-                                "Previous implementor run failed with code {code}."
-                            )),
-                            resume_auditor_id: None,
-                            resume_audit_pass: None,
-                        },
-                    });
-                    messages.push(format!(
-                        "System: Task #{} implementation failed (code {}); retry queued.",
-                        job.top_task_id, code
-                    ));
-                }
+                    code,
+                    &mut messages,
+                );
             }
             WorkerJobKind::Auditor {
                 implementor_id,
@@ -583,70 +534,21 @@ impl Workflow {
                 pass,
                 implementation_report,
                 changed_files_summary,
+                ..
             } => {
-                self.push_context(make_context_summary(
-                    "Auditor",
-                    &self.task_title(job.top_task_id),
+                implementation_auditor::on_completion(
+                    self,
+                    job.top_task_id,
+                    implementor_id,
+                    auditor_id,
+                    pass,
+                    implementation_report,
+                    changed_files_summary,
                     &transcript,
                     success,
-                ));
-
-                let issues = !success || audit_detects_issues(&transcript);
-                if issues {
-                    self.set_status(implementor_id, TaskStatus::NeedsChanges);
-                    if pass >= MAX_AUDIT_RETRIES {
-                        self.set_status(auditor_id, TaskStatus::Done);
-                        self.recent_failures.push(WorkflowFailure {
-                            kind: WorkflowFailureKind::Audit,
-                            top_task_id: job.top_task_id,
-                            top_task_title: self.task_title(job.top_task_id),
-                            attempts: pass,
-                            reason: audit_feedback(&transcript, code, success),
-                            action_taken:
-                                "Audit retries exhausted; continued execution to next audit/step."
-                                    .to_string(),
-                        });
-                        let _ = self.queue_next_implementor_audit(
-                            job.top_task_id,
-                            implementor_id,
-                            1,
-                            implementation_report,
-                            changed_files_summary,
-                            &mut messages,
-                        );
-                        messages.push(format!(
-                            "System: Task #{} audit still found critical blockers at pass {}. Max retries ({}) reached; proceeding to next audit/step.",
-                            job.top_task_id, pass, MAX_AUDIT_RETRIES
-                        ));
-                    } else {
-                        self.set_status(auditor_id, TaskStatus::NeedsChanges);
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::Implementor {
-                                implementor_id,
-                                pass: pass.saturating_add(1),
-                                feedback: Some(audit_feedback(&transcript, code, success)),
-                                resume_auditor_id: Some(auditor_id),
-                                resume_audit_pass: Some(pass.saturating_add(1)),
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} audit requested fixes; implementor pass {} queued.",
-                            job.top_task_id,
-                            pass.saturating_add(1)
-                        ));
-                    }
-                } else {
-                    self.set_status(auditor_id, TaskStatus::Done);
-                    let _ = self.queue_next_implementor_audit(
-                        job.top_task_id,
-                        implementor_id,
-                        1,
-                        implementation_report,
-                        changed_files_summary,
-                        &mut messages,
-                    );
-                }
+                    code,
+                    &mut messages,
+                );
             }
             WorkerJobKind::TestWriter {
                 test_writer_id,
@@ -656,91 +558,19 @@ impl Workflow {
                 resume_audit_pass,
                 ..
             } => {
-                self.push_context(make_context_summary(
-                    "TestWriter",
-                    &self.task_title(job.top_task_id),
+                test_writer::on_completion(
+                    self,
+                    job.top_task_id,
+                    test_writer_id,
+                    pass,
+                    skip_test_runner_on_success,
+                    resume_auditor_id,
+                    resume_audit_pass,
                     &transcript,
                     success,
-                ));
-
-                if success {
-                    if skip_test_runner_on_success {
-                        self.set_status(test_writer_id, TaskStatus::Done);
-                        messages.push(format!(
-                            "System: Task #{} removed failing tests after retries and proceeded.",
-                            job.top_task_id
-                        ));
-                        self.try_mark_top_done(job.top_task_id, &mut messages);
-                        if self.execution_enabled {
-                            let _ = self.enqueue_ready_top_tasks();
-                        }
-                        return messages;
-                    }
-                    if let Some(auditor_id) = resume_auditor_id {
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::TestWriterAuditor {
-                                test_writer_id,
-                                auditor_id,
-                                pass: resume_audit_pass.unwrap_or(1),
-                                test_report: Some(transcript.join("\n")),
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} test-writer pass {} complete; resumed audit queued.",
-                            job.top_task_id, pass
-                        ));
-                    } else {
-                        let _ = self.queue_test_writer_next_step(
-                            job.top_task_id,
-                            test_writer_id,
-                            pass,
-                            true,
-                            Some(transcript.join("\n")),
-                            &mut messages,
-                        );
-                    }
-                } else {
-                    self.set_status(test_writer_id, TaskStatus::NeedsChanges);
-                    if pass >= MAX_TEST_RETRIES {
-                        self.set_status(test_writer_id, TaskStatus::Done);
-                        self.recent_failures.push(WorkflowFailure {
-                            kind: WorkflowFailureKind::Test,
-                            top_task_id: job.top_task_id,
-                            top_task_title: self.task_title(job.top_task_id),
-                            attempts: pass,
-                            reason: format!(
-                                "Test-writer failed repeatedly; latest exit code {code}."
-                            ),
-                            action_taken:
-                                "Test-writer retries exhausted; proceeded without adding tests."
-                                    .to_string(),
-                        });
-                        messages.push(format!(
-                            "System: Task #{} test-writer still failing at pass {}. Max retries ({}) reached; proceeding to next step.",
-                            job.top_task_id, pass, MAX_TEST_RETRIES
-                        ));
-                        self.try_mark_top_done(job.top_task_id, &mut messages);
-                    } else {
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::TestWriter {
-                                test_writer_id,
-                                pass: pass.saturating_add(1),
-                                feedback: Some(format!(
-                                    "Previous test-writer run failed with code {code}."
-                                )),
-                                skip_test_runner_on_success: false,
-                                resume_auditor_id: None,
-                                resume_audit_pass: None,
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} test-writer failed (code {}); retry queued.",
-                            job.top_task_id, code
-                        ));
-                    }
-                }
+                    code,
+                    &mut messages,
+                );
             }
             WorkerJobKind::TestWriterAuditor {
                 test_writer_id,
@@ -748,210 +578,52 @@ impl Workflow {
                 pass,
                 test_report,
             } => {
-                self.push_context(make_context_summary(
-                    "Auditor",
-                    &self.task_title(job.top_task_id),
+                test_auditor::on_completion(
+                    self,
+                    job.top_task_id,
+                    test_writer_id,
+                    auditor_id,
+                    pass,
+                    test_report,
                     &transcript,
                     success,
-                ));
-
-                let issues = !success || audit_detects_issues(&transcript);
-                if issues {
-                    self.set_status(test_writer_id, TaskStatus::NeedsChanges);
-                    if pass >= MAX_AUDIT_RETRIES {
-                        self.set_status(auditor_id, TaskStatus::Done);
-                        self.recent_failures.push(WorkflowFailure {
-                            kind: WorkflowFailureKind::Audit,
-                            top_task_id: job.top_task_id,
-                            top_task_title: self.task_title(job.top_task_id),
-                            attempts: pass,
-                            reason: audit_feedback(&transcript, code, success),
-                            action_taken:
-                                "Test-writer audit retries exhausted; continued to deterministic test run."
-                                    .to_string(),
-                        });
-                        let _ = self.queue_test_writer_next_step(
-                            job.top_task_id,
-                            test_writer_id,
-                            pass,
-                            true,
-                            test_report,
-                            &mut messages,
-                        );
-                        messages.push(format!(
-                            "System: Task #{} test-writer audit still found critical blockers at pass {}. Max retries ({}) reached; proceeding to deterministic tests.",
-                            job.top_task_id, pass, MAX_AUDIT_RETRIES
-                        ));
-                    } else {
-                        self.set_status(auditor_id, TaskStatus::NeedsChanges);
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::TestWriter {
-                                test_writer_id,
-                                pass: pass.saturating_add(1),
-                                feedback: Some(audit_feedback(&transcript, code, success)),
-                                skip_test_runner_on_success: false,
-                                resume_auditor_id: Some(auditor_id),
-                                resume_audit_pass: Some(pass.saturating_add(1)),
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} test-writer audit requested fixes; test-writer pass {} queued.",
-                            job.top_task_id,
-                            pass.saturating_add(1)
-                        ));
-                    }
-                } else {
-                    self.set_status(auditor_id, TaskStatus::Done);
-                    let _ = self.queue_test_writer_next_step(
-                        job.top_task_id,
-                        test_writer_id,
-                        pass,
-                        true,
-                        test_report,
-                        &mut messages,
-                    );
-                    messages.push(format!(
-                        "System: Task #{} test-writer audit pass {} complete.",
-                        job.top_task_id, pass
-                    ));
-                }
+                    code,
+                    &mut messages,
+                );
             }
             WorkerJobKind::TestRunner {
                 test_writer_id,
                 test_runner_id,
                 pass,
             } => {
-                self.set_status(test_runner_id, TaskStatus::Done);
-                self.push_context(make_context_summary(
-                    "TestRunner",
-                    &self.task_title(job.top_task_id),
+                test_runner::on_writer_completion(
+                    self,
+                    job.top_task_id,
+                    test_writer_id,
+                    test_runner_id,
+                    pass,
                     &transcript,
                     success,
-                ));
-
-                if success {
-                    self.set_status(test_writer_id, TaskStatus::Done);
-                    messages.push(format!(
-                        "System: Task #{} deterministic tests passed on run {}.",
-                        job.top_task_id, pass
-                    ));
-                    self.try_mark_top_done(job.top_task_id, &mut messages);
-                } else {
-                    self.set_status(test_writer_id, TaskStatus::NeedsChanges);
-                    if pass >= MAX_TEST_RETRIES {
-                        let failure_reason = test_runner_feedback(&transcript, code);
-                        self.recent_failures.push(WorkflowFailure {
-                            kind: WorkflowFailureKind::Test,
-                            top_task_id: job.top_task_id,
-                            top_task_title: self.task_title(job.top_task_id),
-                            attempts: pass,
-                            reason: failure_reason.clone(),
-                            action_taken:
-                                "Requested test cleanup (remove failing tests) and continued."
-                                    .to_string(),
-                        });
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::TestWriter {
-                                test_writer_id,
-                                pass: pass.saturating_add(1),
-                                feedback: Some(format!(
-                                    "Deterministic test retries exhausted.\n\
-                                     Remove the failing tests completely so they no longer fail.\n\
-                                     Do not add replacement tests in this pass.\n\
-                                     Then report exactly which tests/files were removed.\n\
-                                     Failure details:\n{}",
-                                    failure_reason
-                                )),
-                                skip_test_runner_on_success: true,
-                                resume_auditor_id: None,
-                                resume_audit_pass: None,
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} tests still failing at pass {}. Max retries ({}) reached; queued cleanup removal pass.",
-                            job.top_task_id, pass, MAX_TEST_RETRIES
-                        ));
-                    } else {
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::TestWriter {
-                                test_writer_id,
-                                pass: pass.saturating_add(1),
-                                feedback: Some(test_runner_feedback(&transcript, code)),
-                                skip_test_runner_on_success: false,
-                                resume_auditor_id: None,
-                                resume_audit_pass: None,
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} tests failed; test-writer pass {} queued.",
-                            job.top_task_id,
-                            pass.saturating_add(1)
-                        ));
-                    }
-                }
+                    code,
+                    &mut messages,
+                );
             }
             WorkerJobKind::ImplementorTestRunner {
                 implementor_id,
                 test_runner_id,
                 pass,
             } => {
-                self.push_context(make_context_summary(
-                    "TestRunner",
-                    &self.task_title(job.top_task_id),
+                test_runner::on_implementor_completion(
+                    self,
+                    job.top_task_id,
+                    implementor_id,
+                    test_runner_id,
+                    pass,
                     &transcript,
                     success,
-                ));
-
-                if success {
-                    self.set_status(test_runner_id, TaskStatus::Done);
-                    self.set_status(implementor_id, TaskStatus::Done);
-                    self.try_mark_top_done(job.top_task_id, &mut messages);
-                    messages.push(format!(
-                        "System: Task #{} existing-test runner passed on run {}; implementor branch complete.",
-                        job.top_task_id, pass
-                    ));
-                } else {
-                    self.set_status(test_runner_id, TaskStatus::NeedsChanges);
-                    if pass >= MAX_TEST_RETRIES {
-                        self.set_status(test_runner_id, TaskStatus::Done);
-                        self.recent_failures.push(WorkflowFailure {
-                            kind: WorkflowFailureKind::Test,
-                            top_task_id: job.top_task_id,
-                            top_task_title: self.task_title(job.top_task_id),
-                            attempts: pass,
-                            reason: test_runner_feedback(&transcript, code),
-                            action_taken:
-                                "Existing-tests runner retries exhausted; continued to next step."
-                                    .to_string(),
-                        });
-                        self.set_status(implementor_id, TaskStatus::Done);
-                        self.try_mark_top_done(job.top_task_id, &mut messages);
-                        messages.push(format!(
-                            "System: Task #{} existing tests still failing at pass {}. Max retries ({}) reached; proceeding to next step.",
-                            job.top_task_id, pass, MAX_TEST_RETRIES
-                        ));
-                    } else {
-                        self.set_status(implementor_id, TaskStatus::NeedsChanges);
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: job.top_task_id,
-                            kind: WorkerJobKind::Implementor {
-                                implementor_id,
-                                pass: pass.saturating_add(1),
-                                feedback: Some(test_runner_feedback(&transcript, code)),
-                                resume_auditor_id: None,
-                                resume_audit_pass: None,
-                            },
-                        });
-                        messages.push(format!(
-                            "System: Task #{} existing tests failed; implementor pass {} queued.",
-                            job.top_task_id,
-                            pass.saturating_add(1)
-                        ));
-                    }
-                }
+                    code,
+                    &mut messages,
+                );
             }
             WorkerJobKind::FinalAudit {
                 final_audit_id,
@@ -1136,30 +808,11 @@ impl Workflow {
                 feedback,
                 ..
             } => {
-                let prompt = format!(
-                    "You are an implementation sub-agent.\n\
-                 Top-level task: {}\n\
-                 Implementation subtask: {}\n\
-                 Implementation details:\n{}\n\
-                 Rolling task context:\n{}\n\
-                 {}\n\
-                 Guardrail: do not create or modify tests unless this task explicitly includes a direct implementor test_runner flow reporting failing existing tests.\n\
-                 End your response with a structured changed-files summary block using this exact format:\n\
-                 FILES_CHANGED_BEGIN\n\
-                 - path/to/file.ext: brief description of what changed\n\
-                 FILES_CHANGED_END\n\
-                 Include every file you changed. If no files changed, include a single bullet with reason.\n\
-                 Provide concise progress updates and finish with what changed.",
-                    self.task_title(job.top_task_id),
-                    self.node_title(*implementor_id, "Implementation"),
-                    self.node_details(*implementor_id),
-                    self.context_block(),
-                    feedback
-                        .as_ref()
-                        .map(|f| format!("Audit feedback to address:\n{f}"))
-                        .unwrap_or_else(
-                            || "No audit feedback yet; implement from task prompt.".to_string()
-                        )
+                let prompt = implementor::build_prompt(
+                    self,
+                    job.top_task_id,
+                    *implementor_id,
+                    feedback.as_deref(),
                 );
                 JobRun::AgentPrompt(self.prepend_task_docs_to_prompt(*implementor_id, prompt))
             }
@@ -1171,40 +824,14 @@ impl Workflow {
                 pass,
                 ..
             } => {
-                let prompt = format!(
-                    "You are an audit sub-agent reviewing implementation output.\n\
-                 Top-level task: {}\n\
-                 Parent implementor task: {}\n\
-                 Parent implementor details:\n{}\n\
-                 Audit subtask details:\n{}\n\
-                 Audit pass: {} of {}\n\
-                 Rolling task context:\n{}\n\
-                 Implementor changed-files summary:\n{}\n\
-                 Implementation output to audit:\n{}\n\
-                 Guardrail: do not audit test quality/coverage or request test changes; limit findings to implementation concerns only.\n\
-                 Scope lock (required): audit only the parent implementor task/details above. Do not audit unrelated tasks, broader roadmap items, or unrelated files.\n\
-                 Execution guardrail: do not run tests and do not execute/check shell commands. Command/test execution is handled by a subsequent dedicated agent.\n\
-                 Strictness policy for this audit pass:\n{}\n\
-                 Response protocol (required):\n\
-                 - First line must be exactly one of:\n\
-                   AUDIT_RESULT: PASS\n\
-                   AUDIT_RESULT: FAIL\n\
-                 - Then provide concise findings. If PASS, include a brief rationale.\n\
-                 - If FAIL, include concrete issues and suggested fixes. On pass 4, only FAIL for truly critical blockers that would prevent the broader plan from running.",
-                    self.task_title(job.top_task_id),
-                    self.node_title(*implementor_id, "Implementation"),
-                    self.node_details(*implementor_id),
-                    self.node_details(*auditor_id),
-                    pass,
-                    MAX_AUDIT_RETRIES,
-                    self.context_block(),
-                    changed_files_summary
-                        .as_deref()
-                        .unwrap_or("(implementor did not provide a changed-files summary)"),
-                    implementation_report
-                        .as_deref()
-                        .unwrap_or("(no implementation output captured)"),
-                    audit_strictness_policy(*pass),
+                let prompt = implementation_auditor::build_prompt(
+                    self,
+                    job.top_task_id,
+                    *implementor_id,
+                    *auditor_id,
+                    implementation_report,
+                    changed_files_summary,
+                    *pass,
                 );
                 JobRun::AgentPrompt(self.prepend_task_docs_to_prompt(*auditor_id, prompt))
             }
@@ -1215,35 +842,13 @@ impl Workflow {
                 pass,
                 ..
             } => {
-                let prompt = format!(
-                    "You are an audit sub-agent reviewing test-writing output.\n\
-                 Top-level task: {}\n\
-                 Parent test-writer task: {}\n\
-                 Parent test-writer details:\n{}\n\
-                 Audit subtask details:\n{}\n\
-                 Audit pass: {} of {}\n\
-                 Rolling task context:\n{}\n\
-                 Test-writer output to audit:\n{}\n\
-                 Focus on test quality, coverage relevance, and whether tests clearly validate intended behavior.\n\
-                 Execution guardrail: do not run tests and do not execute/check shell commands. Command/test execution is handled by a subsequent dedicated agent.\n\
-                 Strictness policy for this audit pass:\n{}\n\
-                 Response protocol (required):\n\
-                 - First line must be exactly one of:\n\
-                   AUDIT_RESULT: PASS\n\
-                   AUDIT_RESULT: FAIL\n\
-                 - Then provide concise findings. If PASS, include a brief rationale.\n\
-                 - If FAIL, include concrete issues and suggested fixes. On pass 4, only FAIL for truly critical blockers that would prevent the broader plan from running.",
-                    self.task_title(job.top_task_id),
-                    self.node_title(*test_writer_id, "Test Writing"),
-                    self.node_details(*test_writer_id),
-                    self.node_details(*auditor_id),
-                    pass,
-                    MAX_AUDIT_RETRIES,
-                    self.context_block(),
-                    test_report
-                        .as_deref()
-                        .unwrap_or("(no test-writer output captured)"),
-                    audit_strictness_policy(*pass),
+                let prompt = test_auditor::build_prompt(
+                    self,
+                    job.top_task_id,
+                    *test_writer_id,
+                    *auditor_id,
+                    test_report,
+                    *pass,
                 );
                 JobRun::AgentPrompt(self.prepend_task_docs_to_prompt(*auditor_id, prompt))
             }
@@ -1253,29 +858,12 @@ impl Workflow {
                 skip_test_runner_on_success,
                 ..
             } => {
-                let prompt = format!(
-                    "You are a test-writer sub-agent.\n\
-                 Top-level task: {}\n\
-                 Test-writer subtask: {}\n\
-                 Test-writing details:\n{}\n\
-                 Rolling task context:\n{}\n\
-                 {}\n\
-                 Write or update tests to cover current implementation thoroughly.\n\
-                 {}\n\
-                 Keep output concise and include what test behavior was added.",
-                    self.task_title(job.top_task_id),
-                    self.node_title(*test_writer_id, "Test Writing"),
-                    self.node_details(*test_writer_id),
-                    self.context_block(),
-                    feedback
-                        .as_deref()
-                        .map(|f| format!("Feedback to address before re-running deterministic tests:\n{f}"))
-                        .unwrap_or_else(|| "No test feedback yet; infer tests from task and implementation branch progress.".to_string()),
-                    if *skip_test_runner_on_success {
-                        "Special instruction: this is a cleanup pass after exhausted deterministic test retries. Remove failing tests and do not add replacements."
-                    } else {
-                        ""
-                    }
+                let prompt = test_writer::build_prompt(
+                    self,
+                    job.top_task_id,
+                    *test_writer_id,
+                    feedback.as_deref(),
+                    *skip_test_runner_on_success,
                 );
                 JobRun::AgentPrompt(self.prepend_task_docs_to_prompt(*test_writer_id, prompt))
             }
@@ -1466,125 +1054,100 @@ impl Workflow {
     }
 
     fn enqueue_ready_top_tasks(&mut self) -> usize {
-        let mut queued = 0usize;
-        let next_top_id = self
-            .tasks
+        let root_ids: Vec<u64> = self
+            .ordered_root_nodes()
             .iter()
-            .find(|node| node.kind == TaskKind::Top && node.status != TaskStatus::Done)
-            .map(|node| node.id);
-        let final_audit_ids: Vec<u64> = self
-            .tasks
-            .iter()
-            .filter(|node| node.kind == TaskKind::FinalAudit)
+            .filter(|node| matches!(node.kind, TaskKind::Top | TaskKind::FinalAudit))
             .map(|node| node.id)
             .collect();
 
-        self.retain_final_audit_jobs_only_when_non_final_done();
+        let mut queued = 0usize;
+        let mut on_completion_messages = Vec::<String>::new();
+        let mut non_final_all_done = self
+            .tasks
+            .iter()
+            .filter(|node| node.kind != TaskKind::FinalAudit)
+            .all(|node| node.status == TaskStatus::Done);
 
-        if let Some(top_id) = next_top_id {
-            let (has_any_children, existing_implementor_id, existing_test_writer_id) =
-                if let Some(top) = find_node(&self.tasks, top_id) {
-                    (
-                        !top.children.is_empty(),
-                        top.children
-                            .iter()
-                            .find(|child| child.kind == TaskKind::Implementor)
-                            .map(|child| child.id),
-                        top.children
-                            .iter()
-                            .find(|child| child.kind == TaskKind::TestWriter)
-                            .map(|child| child.id),
-                    )
-                } else {
-                    (false, None, None)
-                };
+        if !non_final_all_done {
+            self.queue
+                .retain(|job| !matches!(job.kind, WorkerJobKind::FinalAudit { .. }));
+        }
 
-            let implementor_id = if let Some(id) = existing_implementor_id {
-                Some(id)
-            } else if !has_any_children {
-                self.start_kind_for_top(top_id, TaskKind::Implementor, "Implementation")
+        for top_id in &root_ids {
+            let Some(top) = find_node(&self.tasks, *top_id) else {
+                continue;
+            };
+            let top_status = top.status;
+            let top_kind = top.kind;
+            let top_children_empty = top.children.is_empty();
+            let has_existing_top_level_test_writer = top
+                .children
+                .iter()
+                .any(|child| child.kind == TaskKind::TestWriter);
+
+            if top_status == TaskStatus::Done {
+                continue;
+            }
+
+            if top_kind == TaskKind::FinalAudit {
+                break;
+            }
+
+            let has_top_level_test_writer = if top_children_empty {
+                let _ = self.start_kind_for_top(*top_id, TaskKind::TestWriter, "Test Writing");
+                true
             } else {
-                None
+                has_existing_top_level_test_writer
             };
 
-            if let Some(implementor_id) = implementor_id {
-                if !self.branch_has_active_or_queued(top_id, TaskKind::Implementor)
-                    && self.status_of(top_id) != Some(TaskStatus::NeedsChanges)
-                {
-                    let impl_status = self.status_of(implementor_id);
-                    let has_pending_impl_audit =
-                        self.find_next_pending_child_kind(implementor_id, TaskKind::Auditor)
-                            .is_some();
+            let Some(implementor_id) = self.start_kind_for_top(*top_id, TaskKind::Implementor, "Implementation") else {
+                continue;
+            };
+            self.find_or_create_child_kind(implementor_id, TaskKind::Auditor, "Audit");
 
-                    if impl_status == Some(TaskStatus::Done)
-                        || (impl_status == Some(TaskStatus::InProgress) && has_pending_impl_audit)
-                    {
-                        if impl_status == Some(TaskStatus::InProgress) && has_pending_impl_audit {
-                            // Backward-compat: older runs could leave implementor InProgress
-                            // while an audit was pending/running.
-                            self.set_status(implementor_id, TaskStatus::Done);
-                        }
-                        let mut resume_messages = Vec::new();
+            if let Some(implementor_id) = self.find_next_pending_child_kind(*top_id, TaskKind::Implementor) {
+                if !self.branch_has_active_or_queued(*top_id, TaskKind::Implementor) {
+                    let impl_status = self.status_of(implementor_id);
+                    let has_pending_impl_audit = self
+                        .find_next_pending_child_kind(implementor_id, TaskKind::Auditor)
+                        .is_some();
+                    if impl_status == Some(TaskStatus::InProgress) && has_pending_impl_audit {
+                        // Backward-compat: older runs can leave implementor InProgress while
+                        // an auditor is pending/running. Resume at auditor, not implementor.
+                        self.set_status(implementor_id, TaskStatus::Done);
                         if self.queue_next_implementor_audit(
-                            top_id,
+                            *top_id,
                             implementor_id,
                             1,
                             None,
                             None,
-                            &mut resume_messages,
+                            &mut on_completion_messages,
                         ) {
-                            queued = queued.saturating_add(1);
+                            queued += 1;
                         }
-                    } else {
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: top_id,
-                            kind: WorkerJobKind::Implementor {
-                                implementor_id,
-                                pass: 1,
-                                feedback: None,
-                                resume_auditor_id: None,
-                                resume_audit_pass: None,
-                            },
-                        });
-                        queued = queued.saturating_add(1);
+                        return queued;
                     }
+                    self.queue.push_back(WorkerJob {
+                        top_task_id: *top_id,
+                        kind: WorkerJobKind::Implementor {
+                            implementor_id,
+                            pass: 1,
+                            feedback: None,
+                            resume_auditor_id: None,
+                            resume_audit_pass: None,
+                        },
+                    });
+                    queued += 1;
                 }
+                return queued;
+            }
 
-                let maybe_test_writer_id = if let Some(id) = existing_test_writer_id {
-                    Some(id)
-                } else if !has_any_children {
-                    self.start_kind_for_top(top_id, TaskKind::TestWriter, "Test Writing")
-                } else {
-                    None
-                };
-                if let Some(test_writer_id) = maybe_test_writer_id
-                    && !self.branch_has_active_or_queued(top_id, TaskKind::TestWriter)
-                    && self.status_of(top_id) != Some(TaskStatus::NeedsChanges)
-                {
-                    let writer_status = self.status_of(test_writer_id);
-                    let has_pending_writer_audit =
-                        self.find_next_pending_child_kind(test_writer_id, TaskKind::Auditor)
-                            .is_some();
-                    let has_pending_writer_runner =
-                        self.find_next_pending_child_kind(test_writer_id, TaskKind::TestRunner)
-                            .is_some();
-                    if writer_status == Some(TaskStatus::Done)
-                        && (has_pending_writer_audit || has_pending_writer_runner)
-                    {
-                        let mut resume_messages = Vec::new();
-                        if self.queue_test_writer_next_step(
-                            top_id,
-                            test_writer_id,
-                            1,
-                            true,
-                            None,
-                            &mut resume_messages,
-                        ) {
-                            queued = queued.saturating_add(1);
-                        }
-                    } else if writer_status != Some(TaskStatus::Done) {
-                        self.queue.push_back(WorkerJob {
-                            top_task_id: top_id,
+            if has_top_level_test_writer {
+                if let Some(test_writer_id) = self.find_next_pending_child_kind(*top_id, TaskKind::TestWriter) {
+                    if !self.branch_has_active_or_queued(*top_id, TaskKind::TestWriter) {
+                        self.queue.push_front(WorkerJob {
+                            top_task_id: *top_id,
                             kind: WorkerJobKind::TestWriter {
                                 test_writer_id,
                                 pass: 1,
@@ -1594,57 +1157,61 @@ impl Workflow {
                                 resume_audit_pass: None,
                             },
                         });
-                        queued = queued.saturating_add(1);
+                        queued += 1;
                     }
+                    return queued;
                 }
             }
+
+            if self.branch_has_active_or_queued(*top_id, TaskKind::Implementor) {
+                return queued;
+            }
+
+            let queued_next = self.queue_next_implementor_audit(
+                *top_id,
+                implementor_id,
+                1,
+                None,
+                None,
+                &mut on_completion_messages,
+            );
+            if queued_next {
+                return queued;
+            }
+            // No additional work was enqueued for this top; allow scanning subsequent top-level
+            // tasks (including final-audit scheduling) when non-final work is complete.
         }
 
-        let non_final_all_done = self
+        non_final_all_done = self
             .tasks
             .iter()
-            .filter(|node| node.kind == TaskKind::Top)
+            .filter(|node| node.kind != TaskKind::FinalAudit)
             .all(|node| node.status == TaskStatus::Done);
 
-        if !non_final_all_done {
-            for final_id in final_audit_ids {
-                if self.status_of(final_id) == Some(TaskStatus::Done) {
-                    self.set_status(final_id, TaskStatus::Pending);
+        if non_final_all_done {
+            for top_id in root_ids {
+                let Some(top) = find_node(&self.tasks, top_id) else {
+                    continue;
+                };
+                if top.kind != TaskKind::FinalAudit || top.status == TaskStatus::Done {
+                    continue;
                 }
-            }
-            return queued;
-        }
-
-        for final_id in final_audit_ids {
-            if !self.final_audit_has_active_or_queued(final_id)
-                && self.status_of(final_id) != Some(TaskStatus::Done)
-            {
+                if self.final_audit_has_active_or_queued(top_id) {
+                    continue;
+                }
                 self.queue.push_back(WorkerJob {
-                    top_task_id: final_id,
+                    top_task_id: top_id,
                     kind: WorkerJobKind::FinalAudit {
-                        final_audit_id: final_id,
+                        final_audit_id: top_id,
                         pass: 1,
                         feedback: None,
                     },
                 });
-                queued = queued.saturating_add(1);
+                queued += 1;
             }
         }
 
         queued
-    }
-
-    fn retain_final_audit_jobs_only_when_non_final_done(&mut self) {
-        let non_final_all_done = self
-            .tasks
-            .iter()
-            .filter(|node| node.kind == TaskKind::Top)
-            .all(|node| node.status == TaskStatus::Done);
-        if non_final_all_done {
-            return;
-        }
-        self.queue
-            .retain(|job| !matches!(job.kind, WorkerJobKind::FinalAudit { .. }));
     }
 
     fn final_audit_has_active_or_queued(&self, final_audit_id: u64) -> bool {
@@ -4196,6 +3763,99 @@ mod tests {
             }
             JobRun::DeterministicTestRun => panic!("expected auditor prompt"),
         }
+    }
+
+    #[test]
+    fn start_execution_resumes_with_in_progress_implementor_and_pending_auditor_subtask() {
+        let mut wf = Workflow::default();
+        wf.sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "top".to_string(),
+                title: "Task".to_string(),
+                details: "top details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl".to_string(),
+                title: "Implementation".to_string(),
+                details: "impl details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Implementor,
+                status: PlannerTaskStatusFile::InProgress,
+                parent_id: Some("top".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-audit".to_string(),
+                title: "Audit".to_string(),
+                details: "audit details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(0),
+            },
+        ])
+        .expect("sync should succeed");
+
+        wf.start_execution();
+        let started = wf.start_next_job().expect("should resume pending auditor");
+        assert_eq!(started.role, WorkerRole::Auditor);
+        match started.run {
+            JobRun::AgentPrompt(prompt) => {
+                assert!(prompt.contains("reviewing implementation output"));
+            }
+            JobRun::DeterministicTestRun => panic!("expected auditor prompt"),
+        }
+    }
+
+    #[test]
+    fn enqueue_ready_does_not_mutate_done_or_final_audit_roots() {
+        let mut wf = Workflow::default();
+        wf.sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "done".to_string(),
+                title: "Already done".to_string(),
+                details: "done details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Done,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "fa".to_string(),
+                title: "Final Audit".to_string(),
+                details: "final audit details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::FinalAudit,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(1),
+            },
+        ])
+        .expect("sync should succeed");
+
+        wf.start_execution();
+
+        let snapshot = wf.planner_tasks_for_file();
+        assert!(
+            !snapshot
+                .iter()
+                .any(|entry| entry.parent_id.as_deref() == Some("done"))
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|entry| entry.parent_id.as_deref() == Some("fa"))
+        );
+
+        let final_job = wf.start_next_job().expect("final audit should be queued");
+        assert_eq!(final_job.role, WorkerRole::FinalAudit);
     }
 
     #[test]

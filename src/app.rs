@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::session_store::PlannerTaskFileEntry;
+use crate::subagents;
 use crate::text_layout::wrap_word_with_positions;
 use crate::workflow::{RightPaneBlockView, StartedJob, WorkerRole, Workflow, WorkflowFailure};
 
@@ -270,46 +271,7 @@ impl App {
     }
 
     pub fn prepare_master_prompt(&self, message: &str, tasks_file: &str) -> String {
-        format!(
-            "{}\n\
-             Planner storage:\n\
-             - Read and update this JSON file directly: {tasks_file}\n\
-             - Never modify project workspace/source files directly.\n\
-             - You may only edit files in the current meta-agent session directory (including tasks/context artifacts).\n\
-             - If user requests more work after existing tasks are completed, append new tasks; do not delete completed task history.\n\
-             - After task list updates are ready, tell the user `/start` is ready to run.\n\
-             - `/start` always resumes from the last unfinished task.\n\
-             - File schema: array of objects with fields id, title, details, docs, kind, status, parent_id, order\n\
-             - kind values: task, final_audit, implementor, auditor, test_writer, test_runner\n\
-             - `docs` is reserved for `/attach-docs`. Do not populate or modify `docs` in master edits.\n\
-             - For new tasks created by master, set `docs` to [] and leave it empty.\n\
-             - Every task and sub-task must include a non-empty details field with concrete implementation/audit/test intent.\n\
-             - Testing-decision flow before initial planning in a session:\n\
-               If project info indicates tests are absent/unknown, ask user whether to set up a testing system first.\n\
-               If tests exist, ask whether to write new tests as part of this work.\n\
-               If tests exist, also ask whether to enforce existing tests (do not break) or ignore tests entirely.\n\
-             - Use task structure based on user testing choices:\n\
-               Always include implementor under each top-level task.\n\
-               Every implementor must include at least one auditor subtask.\n\
-               Implementor scope should avoid test-writing/modification unless tied to a direct implementor test_runner branch for existing-test verification.\n\
-               Implementor auditors must not include test-related checks; test concerns belong only to test_runner/test_writer branches.\n\
-               Include test_writer branch only when user wants new tests written.\n\
-               Every test_writer must be a direct child of the top-level task (no nested/umbrella test_writer grouping tasks).\n\
-               If user wants existing tests enforced, include test_runner under implementor so failures report back to implementor.\n\
-               If implementor has a test_runner, order it after implementor audit subtasks.\n\
-               Every test_writer must include at least one test_runner subtask.\n\
-               If user chooses to ignore tests, omit test_writer and implementor test_runner branches.\n\
-               Special case when tests are absent/unknown and user wants tests:\n\
-               Create a dedicated testing-setup top-level task at the earliest position (before feature work that depends on tests).\n\
-               That setup task must include an implementor + auditor flow where implementor sets up the test framework/tooling and updates session meta.json test_command to the exact bash-runnable command string.\n\
-               Do not add non-setup test_writer or test_runner branches until after that setup task in task order.\n\
-             - If user testing choices are still missing, ask concise questions first and wait; do not write tasks.json yet.\n\
-             - Update tasks.json only when task state should change.\n\
-             - Conversational answers that do not change task state do not require tasks.json edits.\n\
-             - Do not ask the user to start execution until task updates are ready.\n\
-             - After updating tasks.json, explain to the user what changed.",
-            self.workflow.prepare_master_prompt(message)
-        )
+        subagents::build_master_prompt(tasks_file, &self.workflow.prepare_master_prompt(message))
     }
 
     pub fn prepare_context_report_prompt(&self, context_entries: &[String]) -> String {

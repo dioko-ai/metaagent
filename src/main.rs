@@ -15,6 +15,7 @@ mod agent;
 mod app;
 mod deterministic;
 mod events;
+mod subagents;
 mod session_store;
 mod text_layout;
 mod theme;
@@ -312,7 +313,7 @@ fn run_app(
                                     task_file_fix_retry_count.saturating_add(1);
                                 requested_task_file_retry = true;
                                 master_adapter.send_prompt(
-                                    prepend_master_session_intro_if_needed(
+                                    subagents::build_session_intro_if_needed(
                                         "tasks.json failed to parse/validate. Fix tasks.json immediately and retry. \
                                      Ensure id and parent_id are valid values and hierarchy is valid. \
                                      Do not ask the user to start execution yet.",
@@ -368,7 +369,7 @@ fn run_app(
                             app.push_subagent_output(
                                 "TaskCheckSystem: Checking updated tasks.json".to_string(),
                             );
-                            task_check_adapter.send_prompt(build_task_check_prompt(
+                            task_check_adapter.send_prompt(subagents::build_task_check_prompt(
                                 &active_session.tasks_file().display().to_string(),
                                 &active_session.project_info_file().display().to_string(),
                                 &active_session.session_meta_file().display().to_string(),
@@ -431,7 +432,7 @@ fn run_app(
                             ));
                         }
                         let prompt = app.prepare_context_report_prompt(&new_context_entries);
-                        master_report_adapter.send_prompt(prepend_master_session_intro_if_needed(
+                        master_report_adapter.send_prompt(subagents::build_session_intro_if_needed(
                             &prompt,
                             active_session.session_dir().display().to_string().as_str(),
                             &active_session.session_meta_file().display().to_string(),
@@ -488,7 +489,7 @@ fn run_app(
                             ));
                         }
                         let prompt = app.prepare_context_report_prompt(&new_context_entries);
-                        master_report_adapter.send_prompt(prepend_master_session_intro_if_needed(
+                        master_report_adapter.send_prompt(subagents::build_session_intro_if_needed(
                             &prompt,
                             active_session.session_dir().display().to_string().as_str(),
                             &active_session.session_meta_file().display().to_string(),
@@ -593,7 +594,7 @@ fn run_app(
                                 if let Some(original_prompt) =
                                     pending_master_message_after_project_info.as_deref()
                                 {
-                                    let meta_prompt = build_session_meta_prompt(
+                                    let meta_prompt = subagents::build_session_meta_prompt(
                                         original_prompt,
                                         &active_session.session_meta_file().display().to_string(),
                                     );
@@ -650,7 +651,7 @@ fn run_app(
                                 &active_session.tasks_file().display().to_string(),
                             )
                         };
-                        let with_intro = prepend_master_session_intro_if_needed(
+                        let with_intro = subagents::build_session_intro_if_needed(
                             &master_prompt,
                             active_session.session_dir().display().to_string().as_str(),
                             &active_session.session_meta_file().display().to_string(),
@@ -1252,7 +1253,7 @@ fn submit_user_message(
             "System: Converting planner.md into tasks.json in task mode...".to_string(),
         );
 
-        let command_prompt = build_convert_plan_prompt(
+        let command_prompt = subagents::build_convert_plan_prompt(
             &active_session.planner_file().display().to_string(),
             &active_session.tasks_file().display().to_string(),
         );
@@ -1260,7 +1261,7 @@ fn submit_user_message(
             &command_prompt,
             &active_session.tasks_file().display().to_string(),
         );
-        let with_intro = prepend_master_session_intro_if_needed(
+        let with_intro = subagents::build_session_intro_if_needed(
             &master_prompt,
             active_session.session_dir().display().to_string().as_str(),
             &active_session.session_meta_file().display().to_string(),
@@ -1296,7 +1297,7 @@ fn submit_user_message(
             .expect("non-slash messages require an active session");
         if project_info_text.is_none() {
             if !*project_info_in_flight {
-                let prompt = build_project_info_prompt(
+                let prompt = subagents::build_project_info_prompt(
                     &cwd.display().to_string(),
                     &message,
                     &active_session.project_info_file().display().to_string(),
@@ -1328,7 +1329,7 @@ fn submit_user_message(
                     &active_session.tasks_file().display().to_string(),
                 )
             };
-            let with_intro = prepend_master_session_intro_if_needed(
+            let with_intro = subagents::build_session_intro_if_needed(
                 &master_prompt,
                 active_session.session_dir().display().to_string().as_str(),
                 &active_session.session_meta_file().display().to_string(),
@@ -1674,57 +1675,18 @@ fn handle_exhausted_loop_failures(
     }
 
     let has_test_failure = fail_entries.iter().any(|entry| entry.kind == "test");
-    let prompt = build_failure_report_prompt(
+    let prompt = subagents::build_failure_report_prompt(
         &session_store.task_fails_file().display().to_string(),
         &fail_entries,
         has_test_failure,
     );
-    master_report_adapter.send_prompt(prepend_master_session_intro_if_needed(
+    master_report_adapter.send_prompt(subagents::build_session_intro_if_needed(
         &prompt,
         session_store.session_dir().display().to_string().as_str(),
         &session_store.session_meta_file().display().to_string(),
         project_info_text,
         master_report_session_intro_needed,
     ));
-}
-
-fn build_failure_report_prompt(
-    task_fails_file: &str,
-    failed_this_cycle: &[TaskFailFileEntry],
-    has_test_failure: bool,
-) -> String {
-    let entries = failed_this_cycle
-        .iter()
-        .map(|entry| {
-            format!(
-                "- kind={} task_id={} title=\"{}\" attempts={} reason={} action={}",
-                entry.kind,
-                entry.top_task_id,
-                entry.top_task_title,
-                entry.attempts,
-                entry.reason,
-                entry.action_taken
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let mut prompt = format!(
-        "Internal update from execution engine:\n\
-         Retry limits were exhausted for one or more branches.\n\
-         The canonical failure log has been appended at: {task_fails_file}\n\
-         Newly failed entries this cycle:\n\
-         {entries}\n\
-         Respond with a short user-facing message summarizing what failed and why.\n\
-         Do not emit task operations and do not modify files.\n"
-    );
-    if has_test_failure {
-        prompt.push_str(
-            "Also ask the user: tests could not be written/kept for some tasks. \
-             Would they like these unresolved items written to TODO.md?\n",
-        );
-    }
-    prompt
 }
 
 fn persist_runtime_tasks_snapshot(app: &App, session_store: &SessionStore) -> io::Result<()> {
@@ -1890,32 +1852,19 @@ fn handle_silent_master_command(
     let (status_message, command_prompt) = match command {
         SilentMasterCommand::SplitAudits => (
             "System: Splitting audits...".to_string(),
-            "Update tasks.json now by splitting audit tasks into more granular audit tasks mapped per concern.\n\
-             Concern examples to map across relevant work: correctness, edge cases, tests/coverage, security, performance, and UX.\n\
-             Keep task hierarchy coherent and preserve non-audit task intent/status where possible.\n\
-             Do not populate or modify docs fields; docs are reserved for /attach-docs.\n\
-             After updating tasks.json, provide a concise user-facing summary."
-                .to_string(),
+            subagents::split_audits_command_prompt(),
         ),
         SilentMasterCommand::MergeAudits => (
             "System: Merging audits...".to_string(),
-            "Update tasks.json now by merging overly granular audit tasks back into a simpler audit structure for each implementation branch.\n\
-             Keep task hierarchy coherent and preserve non-audit task intent/status where possible.\n\
-             Do not populate or modify docs fields; docs are reserved for /attach-docs.\n\
-             After updating tasks.json, provide a concise user-facing summary."
-                .to_string(),
+            subagents::merge_audits_command_prompt(),
         ),
         SilentMasterCommand::SplitTests => (
             "System: Splitting tests...".to_string(),
-            build_split_tests_command_prompt(),
+            subagents::split_tests_command_prompt(),
         ),
         SilentMasterCommand::MergeTests => (
             "System: Merging tests...".to_string(),
-            "Update tasks.json now by merging overly granular test_writer tasks back into a simpler test structure for each implementation branch.\n\
-             Keep task hierarchy coherent and preserve non-test task intent/status where possible.\n\
-             Do not populate or modify docs fields; docs are reserved for /attach-docs.\n\
-             After updating tasks.json, provide a concise user-facing summary."
-                .to_string(),
+            subagents::merge_tests_command_prompt(),
         ),
     };
 
@@ -1924,7 +1873,7 @@ fn handle_silent_master_command(
         &command_prompt,
         &session_store.tasks_file().display().to_string(),
     );
-    let with_intro = prepend_master_session_intro_if_needed(
+    let with_intro = subagents::build_session_intro_if_needed(
         &master_prompt,
         session_store.session_dir().display().to_string().as_str(),
         &session_store.session_meta_file().display().to_string(),
@@ -1968,38 +1917,6 @@ fn is_known_slash_command(message: &str) -> bool {
         || App::is_remove_final_audit_command(trimmed)
 }
 
-fn prepend_master_session_intro_if_needed(
-    prompt: &str,
-    session_dir: &str,
-    session_meta_file: &str,
-    project_info: Option<&str>,
-    intro_needed: &mut bool,
-) -> String {
-    if !*intro_needed {
-        return prompt.to_string();
-    }
-    *intro_needed = false;
-    let mut out = format!(
-        "Meta-agent session working directory: {session_dir}\n\
-         Session metadata file path: {session_meta_file}\n\
-         Use this as the shared project context for this master session.\n\n\
-         Hard guardrail:\n\
-         - Never modify project workspace files directly.\n\
-         - You may only create/update files inside the meta-agent session directory above.\n\
-         - For planning state, only edit the session task/context artifacts in that session directory.\n\n\
-         ",
-    );
-    if let Some(info) = project_info
-        && !info.trim().is_empty()
-    {
-        out.push_str("Project context (project-info.md):\n");
-        out.push_str(info);
-        out.push_str("\n\n");
-    }
-    out.push_str(prompt);
-    out
-}
-
 fn session_test_command(session_store: &SessionStore) -> Option<String> {
     session_store
         .read_session_meta()
@@ -2011,105 +1928,6 @@ fn normalize_test_command(value: Option<String>) -> Option<String> {
     value
         .map(|command| command.trim().to_string())
         .filter(|command| !command.is_empty())
-}
-
-fn build_convert_plan_prompt(planner_file: &str, tasks_file: &str) -> String {
-    format!(
-        "You are the master Codex agent and are now in task mode.\n\
-         Convert the current planner markdown into executable tasks.\n\
-         Read planner markdown at: {planner_file}\n\
-         Update tasks JSON at: {tasks_file}\n\
-         Requirements:\n\
-         - Convert the current plan into concrete task entries and subtasks suitable for execution.\n\
-         - Preserve existing completed task history where possible; append/update pending/in-progress work to reflect the plan.\n\
-         - Keep task hierarchy valid for this workflow (implementor/auditor/test structure guardrails still apply).\n\
-         - Do not modify docs fields except preserving existing values.\n\
-         - Save tasks.json and then provide a concise summary of what changed."
-    )
-}
-
-fn build_project_info_prompt(cwd: &str, question: &str, output_path: &str) -> String {
-    format!(
-        "You are a project-context discovery sub-agent.\n\
-         Analyze the repository and gather concise project context for the user question.\n\
-         Current working directory: {cwd}\n\
-         User question:\n\
-         {question}\n\
-         Requirements:\n\
-         - Inspect only local files in the repository to understand structure, tech stack, and constraints.\n\
-         - Do not browse the web, call external tools/services, or include internet-sourced references.\n\
-         - Write a concise Markdown brief to this exact path: {output_path}\n\
-         - Include sections: \"Project Overview\", \"Language & Tech Stack\", \"File Structure\", \"Relevant Code Areas\", \"Constraints & Conventions\", \"Testing Setup\".\n\
-         - In \"Testing Setup\", explicitly state whether tests currently exist, where they are, and the best command to run the project's tests end-to-end.\n\
-         - The test command in \"Testing Setup\" must be a single verbatim shell command runnable in bash as-is from the repository root (not a description).\n\
-         - If unknown, state unknown and why.\n\
-         - Do not propose implementation ideas, plans, or code-level solutions.\n\
-         - Focus only on repository lay-of-the-land and concise file/folder summaries that help future agents work quickly without re-scanning the whole project.\n\
-         - Do not make unrelated file changes.\n\
-         Then output a short completion summary."
-    )
-}
-
-fn build_task_check_prompt(
-    tasks_file: &str,
-    project_info_file: &str,
-    session_meta_file: &str,
-) -> String {
-    format!(
-        "You are a task-structure audit sub-agent.\n\
-         Review the planner JSON file at: {tasks_file}\n\
-         You may also read project context at: {project_info_file}\n\
-         You may also read session metadata at: {session_meta_file}\n\
-         Requirements:\n\
-         - If issues are found, edit this tasks.json directly to fix them.\n\
-         - Keep task intent/status/order as stable as possible while fixing structure.\n\
-         - Validate task hierarchy and ordering against execution guardrails.\n\
-         - Enforce test-task shape deterministically: each test_writer must be a direct child of a top-level task (no nested test_writer groups).\n\
-         - Focus especially on implementor/auditor/test-runner and test-writer/test-runner relationships.\n\
-         - Enforce special-case sequencing for test bootstrapping:\n\
-           If tests are absent/unknown (from project-info Testing Setup and/or meta.json test_command is null/empty) and the plan includes test-writing/execution work, ensure there is a dedicated testing-setup top-level task before dependent work.\n\
-           That setup task must include implementor and auditor subtasks.\n\
-           The setup implementor details must explicitly include both setting up testing tooling and updating meta.json test_command to an exact bash-runnable command string.\n\
-           Do not allow non-setup test_writer/test_runner branches to run before that setup task in top-level task order.\n\
-         - Return a concise report with either \"PASS\" or \"FIXED\" on the first line, followed by findings.\n\
-         - If fixes were applied, list the specific task ids/titles adjusted.\n\
-         Then exit."
-    )
-}
-
-fn build_split_tests_command_prompt() -> String {
-    "Update tasks.json now by splitting test_writer tasks into more granular test tasks mapped per concern.\n\
-     Concern examples to map across relevant work: core behavior, edge cases, regression paths, error handling, and integration paths.\n\
-     Keep task hierarchy coherent and preserve non-test task intent/status where possible.\n\
-     Use flat test-writer structure only: each test_writer must be a direct child of the top-level task.\n\
-     Do not create umbrella/nested test_writer parent groups.\n\
-     Ensure every test_writer has at least one direct test_runner child.\n\
-     Do not populate or modify docs fields; docs are reserved for /attach-docs.\n\
-     After updating tasks.json, provide a concise user-facing summary."
-        .to_string()
-}
-
-fn build_session_meta_prompt(user_prompt: &str, output_path: &str) -> String {
-    format!(
-        "Using the same session context and project info you already gathered, create session metadata.\n\
-         Write valid JSON to this exact path: {output_path}\n\
-         JSON schema:\n\
-         {{\"title\":\"...\",\"created_at\":\"...\",\"stack_description\":\"...\",\"test_command\":\"...\"}}\n\
-         Requirements:\n\
-         - title: a concise 4-10 word title derived from the user's original request.\n\
-         - created_at: current date-time in ISO-8601 UTC format (example: 2026-02-16T20:14:00Z).\n\
-         - stack_description: a concise 1-2 sentence description of the project's language/technology stack based on gathered project info.\n\
-         - If stack details are uncertain, state that clearly rather than guessing.\n\
-         - test_command: the best command to run the project's tests end-to-end.\n\
-         - test_command must be one exact command string runnable in bash as-is from the repository root (for example: \"cargo test\", \"go test ./...\", \"npm test\").\n\
-         - Do not describe the command or wrap it in markdown/backticks; provide only the raw command string value.\n\
-         - If tests are not set up or unknown, set test_command to JSON null.\n\
-         - Output file content only as JSON (no markdown).\n\
-         - Overwrite the file if it exists.\n\
-         Original user request:\n\
-         {user_prompt}\n\
-         Then output a one-line completion summary."
-    )
 }
 
 fn format_internal_master_update(line: &str) -> String {
@@ -2162,6 +1980,92 @@ where
 #[cfg(test)]
 mod launch_tests {
     use super::*;
+
+    fn open_temp_store(prefix: &str) -> (SessionStore, std::path::PathBuf) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cwd = std::env::current_dir().expect("cwd");
+        let session_dir = std::env::temp_dir().join(format!("{prefix}-{now}"));
+        let store = SessionStore::open_existing(&cwd, &session_dir).expect("open existing store");
+        (store, session_dir)
+    }
+
+    fn integration_plan_with_final() -> Vec<PlannerTaskFileEntry> {
+        vec![
+            PlannerTaskFileEntry {
+                id: "top".to_string(),
+                title: "Task".to_string(),
+                details: "top details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl".to_string(),
+                title: "Implementation".to_string(),
+                details: "impl details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Implementor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-audit".to_string(),
+                title: "Implementation audit".to_string(),
+                details: "audit details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "tw".to_string(),
+                title: "Test writing".to_string(),
+                details: "tw details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestWriter,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("top".to_string()),
+                order: Some(1),
+            },
+            PlannerTaskFileEntry {
+                id: "tw-audit".to_string(),
+                title: "Test audit".to_string(),
+                details: "tw audit details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("tw".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "tw-runner".to_string(),
+                title: "Run tests".to_string(),
+                details: "runner details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::TestRunner,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("tw".to_string()),
+                order: Some(1),
+            },
+            PlannerTaskFileEntry {
+                id: "final".to_string(),
+                title: "Final audit".to_string(),
+                details: "final audit details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::FinalAudit,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(1),
+            },
+        ]
+    }
 
     #[test]
     fn parse_launch_options_accepts_send_file() {
@@ -2404,6 +2308,249 @@ mod launch_tests {
     }
 
     #[test]
+    fn integration_happy_path_persists_and_reloads_cleanly() {
+        let mut app = App::default();
+        app.sync_planner_tasks_from_file(integration_plan_with_final())
+            .expect("sync should succeed");
+        let (store, session_dir) = open_temp_store("metaagent-integration-happy");
+
+        app.start_execution();
+        for _ in 0..40 {
+            let Some(job) = app.start_next_worker_job() else {
+                break;
+            };
+            match job.run {
+                JobRun::AgentPrompt(prompt) => {
+                    if prompt.contains("reviewing implementation output")
+                        || prompt.contains("reviewing test-writing output")
+                        || prompt.contains("final audit sub-agent")
+                    {
+                        app.on_worker_output("AUDIT_RESULT: PASS".to_string());
+                        app.on_worker_output("No issues found".to_string());
+                    } else {
+                        app.on_worker_output("completed".to_string());
+                    }
+                    let _ = app.on_worker_completed(true, 0);
+                }
+                JobRun::DeterministicTestRun => {
+                    app.on_worker_output("all passed".to_string());
+                    let _ = app.on_worker_completed(true, 0);
+                }
+            }
+            persist_runtime_tasks_snapshot(&app, &store).expect("persist runtime snapshot");
+        }
+
+        let persisted = store.read_tasks().expect("read persisted tasks");
+        let top_status = persisted
+            .iter()
+            .find(|entry| entry.id == "top")
+            .map(|entry| entry.status);
+        let final_status = persisted
+            .iter()
+            .find(|entry| entry.id == "final")
+            .map(|entry| entry.status);
+        assert_eq!(top_status, Some(PlannerTaskStatusFile::Done));
+        assert_eq!(final_status, Some(PlannerTaskStatusFile::Done));
+
+        let mut reloaded = App::default();
+        reloaded
+            .sync_planner_tasks_from_file(persisted)
+            .expect("reload from persisted tasks should sync");
+        reloaded.start_execution();
+        assert!(reloaded.start_next_worker_job().is_none());
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
+    #[test]
+    fn integration_retry_paths_recover_without_exhausted_failures() {
+        let mut app = App::default();
+        app.sync_planner_tasks_from_file(integration_plan_with_final())
+            .expect("sync should succeed");
+        let (store, session_dir) = open_temp_store("metaagent-integration-retries");
+
+        let mut impl_audit_failures_left = 1u8;
+        let mut test_audit_failures_left = 1u8;
+        let mut runner_failures_left = 1u8;
+
+        app.start_execution();
+        for _ in 0..80 {
+            let Some(job) = app.start_next_worker_job() else {
+                break;
+            };
+            match job.run {
+                JobRun::AgentPrompt(prompt) => {
+                    if prompt.contains("reviewing implementation output") {
+                        if impl_audit_failures_left > 0 {
+                            impl_audit_failures_left = impl_audit_failures_left.saturating_sub(1);
+                            app.on_worker_output("AUDIT_RESULT: FAIL".to_string());
+                            app.on_worker_output("Critical blocker still present".to_string());
+                        } else {
+                            app.on_worker_output("AUDIT_RESULT: PASS".to_string());
+                            app.on_worker_output("No issues found".to_string());
+                        }
+                    } else if prompt.contains("reviewing test-writing output") {
+                        if test_audit_failures_left > 0 {
+                            test_audit_failures_left =
+                                test_audit_failures_left.saturating_sub(1);
+                            app.on_worker_output("AUDIT_RESULT: FAIL".to_string());
+                            app.on_worker_output("Coverage gap remains".to_string());
+                        } else {
+                            app.on_worker_output("AUDIT_RESULT: PASS".to_string());
+                            app.on_worker_output("No issues found".to_string());
+                        }
+                    } else if prompt.contains("final audit sub-agent") {
+                        app.on_worker_output("AUDIT_RESULT: PASS".to_string());
+                        app.on_worker_output("No issues found".to_string());
+                    } else {
+                        app.on_worker_output("completed".to_string());
+                    }
+                    let _ = app.on_worker_completed(true, 0);
+                }
+                JobRun::DeterministicTestRun => {
+                    if runner_failures_left > 0 {
+                        runner_failures_left = runner_failures_left.saturating_sub(1);
+                        app.on_worker_output("tests failing".to_string());
+                        let _ = app.on_worker_completed(false, 1);
+                    } else {
+                        app.on_worker_output("all passed".to_string());
+                        let _ = app.on_worker_completed(true, 0);
+                    }
+                }
+            }
+            persist_runtime_tasks_snapshot(&app, &store).expect("persist runtime snapshot");
+        }
+
+        let persisted = store.read_tasks().expect("read persisted tasks");
+        let top_status = persisted
+            .iter()
+            .find(|entry| entry.id == "top")
+            .map(|entry| entry.status);
+        let final_status = persisted
+            .iter()
+            .find(|entry| entry.id == "final")
+            .map(|entry| entry.status);
+        assert_eq!(top_status, Some(PlannerTaskStatusFile::Done));
+        assert_eq!(final_status, Some(PlannerTaskStatusFile::Done));
+        assert!(app.drain_worker_failures().is_empty());
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
+    #[test]
+    fn integration_snapshot_does_not_write_illegal_children_for_done_or_final_roots() {
+        let mut app = App::default();
+        app.sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "done-top".to_string(),
+                title: "Done top".to_string(),
+                details: "done details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Done,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "final".to_string(),
+                title: "Final".to_string(),
+                details: "final details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::FinalAudit,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(1),
+            },
+        ])
+        .expect("sync should succeed");
+
+        let (store, session_dir) = open_temp_store("metaagent-integration-root-safety");
+        app.start_execution();
+        persist_runtime_tasks_snapshot(&app, &store).expect("persist runtime snapshot");
+        let persisted = store.read_tasks().expect("read persisted tasks");
+
+        assert!(
+            !persisted
+                .iter()
+                .any(|entry| entry.parent_id.as_deref() == Some("done-top"))
+        );
+        assert!(
+            !persisted
+                .iter()
+                .any(|entry| entry.parent_id.as_deref() == Some("final"))
+        );
+
+        let mut reloaded = App::default();
+        reloaded
+            .sync_planner_tasks_from_file(persisted)
+            .expect("reload from persisted tasks should sync");
+        reloaded.start_execution();
+        let job = reloaded.start_next_worker_job().expect("final audit should run");
+        assert!(matches!(job.run, JobRun::AgentPrompt(_)));
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
+    #[test]
+    fn integration_persisted_legacy_in_progress_impl_resumes_at_auditor() {
+        let mut app = App::default();
+        app.sync_planner_tasks_from_file(vec![
+            PlannerTaskFileEntry {
+                id: "top".to_string(),
+                title: "Task".to_string(),
+                details: "top details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Task,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: None,
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl".to_string(),
+                title: "Implementation".to_string(),
+                details: "impl details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Implementor,
+                status: PlannerTaskStatusFile::InProgress,
+                parent_id: Some("top".to_string()),
+                order: Some(0),
+            },
+            PlannerTaskFileEntry {
+                id: "impl-audit".to_string(),
+                title: "Audit".to_string(),
+                details: "audit details".to_string(),
+                docs: Vec::new(),
+                kind: PlannerTaskKindFile::Auditor,
+                status: PlannerTaskStatusFile::Pending,
+                parent_id: Some("impl".to_string()),
+                order: Some(0),
+            },
+        ])
+        .expect("sync should succeed");
+
+        let (store, session_dir) = open_temp_store("metaagent-integration-legacy-resume");
+        persist_runtime_tasks_snapshot(&app, &store).expect("persist runtime snapshot");
+        let persisted = store.read_tasks().expect("read persisted tasks");
+
+        let mut reloaded = App::default();
+        reloaded
+            .sync_planner_tasks_from_file(persisted)
+            .expect("reload from persisted tasks should sync");
+        reloaded.start_execution();
+        let job = reloaded
+            .start_next_worker_job()
+            .expect("auditor should be resumed");
+        match job.run {
+            JobRun::AgentPrompt(prompt) => {
+                assert!(prompt.contains("reviewing implementation output"));
+            }
+            JobRun::DeterministicTestRun => panic!("expected auditor prompt"),
+        }
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
+    #[test]
     fn global_right_scroll_moves_five_lines_per_event() {
         let mut app = App::default();
         scroll_right_down_global(&mut app, 100);
@@ -2553,7 +2700,7 @@ mod launch_tests {
 
     #[test]
     fn failure_report_prompt_includes_entries_and_todo_question_for_tests() {
-        let prompt = build_failure_report_prompt(
+        let prompt = subagents::build_failure_report_prompt(
             "/tmp/session/task-fails.json",
             &[TaskFailFileEntry {
                 kind: "test".to_string(),
@@ -2593,7 +2740,7 @@ mod launch_tests {
     #[test]
     fn prepends_master_session_intro_once() {
         let mut intro_needed = true;
-        let first = prepend_master_session_intro_if_needed(
+        let first = subagents::build_session_intro_if_needed(
             "Do work",
             "/tmp/session-1",
             "/tmp/session-1/meta.json",
@@ -2607,7 +2754,7 @@ mod launch_tests {
         assert!(first.contains("Project context (project-info.md):"));
         assert!(first.contains("Project info"));
         assert!(first.contains("Do work"));
-        let second = prepend_master_session_intro_if_needed(
+        let second = subagents::build_session_intro_if_needed(
             "Do more",
             "/tmp/session-1",
             "/tmp/session-1/meta.json",
@@ -2619,7 +2766,7 @@ mod launch_tests {
 
     #[test]
     fn project_info_prompt_includes_question_and_output_path() {
-        let prompt = build_project_info_prompt(
+        let prompt = subagents::build_project_info_prompt(
             "/tmp/workspace",
             "How should we implement task batching?",
             "/tmp/session/project-info.md",
@@ -2639,7 +2786,10 @@ mod launch_tests {
 
     #[test]
     fn convert_plan_prompt_references_planner_and_tasks_files() {
-        let prompt = build_convert_plan_prompt("/tmp/session/planner.md", "/tmp/session/tasks.json");
+        let prompt = subagents::build_convert_plan_prompt(
+            "/tmp/session/planner.md",
+            "/tmp/session/tasks.json",
+        );
         assert!(prompt.contains("now in task mode"));
         assert!(prompt.contains("/tmp/session/planner.md"));
         assert!(prompt.contains("/tmp/session/tasks.json"));
@@ -2648,7 +2798,7 @@ mod launch_tests {
 
     #[test]
     fn task_check_prompt_includes_tasks_path_and_guardrails() {
-        let prompt = build_task_check_prompt(
+        let prompt = subagents::build_task_check_prompt(
             "/tmp/session/tasks.json",
             "/tmp/session/project-info.md",
             "/tmp/session/meta.json",
@@ -2667,7 +2817,7 @@ mod launch_tests {
 
     #[test]
     fn split_tests_prompt_requires_flat_test_writer_structure() {
-        let prompt = build_split_tests_command_prompt();
+        let prompt = subagents::split_tests_command_prompt();
         assert!(prompt.contains("each test_writer must be a direct child of the top-level task"));
         assert!(prompt.contains("Do not create umbrella/nested test_writer parent groups"));
         assert!(
@@ -2677,7 +2827,7 @@ mod launch_tests {
 
     #[test]
     fn session_meta_prompt_includes_output_path_and_user_prompt() {
-        let prompt = build_session_meta_prompt(
+        let prompt = subagents::build_session_meta_prompt(
             "Build planner mode and task conversion.",
             "/tmp/session/meta.json",
         );
