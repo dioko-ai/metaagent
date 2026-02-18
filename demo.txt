@@ -1,1 +1,0 @@
-Id like to add a feature to this meta agent. I want there to be a new mode "planner" mode that will replace the right pane task list with a markdown file view, where the user can collaborate with the master agent to build a plan before switching back and creating the task list.

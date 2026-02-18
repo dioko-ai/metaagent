@@ -35,7 +35,7 @@ fn defaults_include_supergenious_alias_labels() {
 
     let baseline = routing.profile_for(CodexAgentKind::WorkerImplementor);
     let aliased = parsed.profile_for(CodexAgentKind::WorkerImplementor);
-    assert_eq!(aliased.model, "gpt-5.3-codex-spark");
+    assert_eq!(aliased.model, "gpt-5.1-codex-mini");
     assert_eq!(aliased.thinking_effort.as_deref(), Some("xhigh"));
     assert_ne!(aliased, baseline);
 }

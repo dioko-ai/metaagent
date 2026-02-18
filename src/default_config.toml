@@ -2,23 +2,23 @@
 root_dir = "~/.metaagent/sessions"
 
 [codex.model_profiles.small-dumb]
-model = "gpt-5.3-codex-spark"
+model = "gpt-5.1-codex-mini"
 thinking_effort = "low"
 
 [codex.model_profiles.small-smart]
-model = "gpt-5.3-codex-spark"
+model = "gpt-5.1-codex-mini"
 thinking_effort = "medium"
 
 [codex.model_profiles.small-genius]
-model = "gpt-5.3-codex-spark"
+model = "gpt-5.1-codex-mini"
 thinking_effort = "high"
 
 [codex.model_profiles.small-supergenius]
-model = "gpt-5.3-codex-spark"
+model = "gpt-5.1-codex-mini"
 thinking_effort = "xhigh"
 
 [codex.model_profiles.small-supergenious]
-model = "gpt-5.3-codex-spark"
+model = "gpt-5.1-codex-mini"
 thinking_effort = "xhigh"
 
 [codex.model_profiles.large-dumb]
@@ -43,10 +43,10 @@ thinking_effort = "xhigh"
 
 [codex.agent_profiles]
 master = "large-smart"
-master_report = "large-smart"
-project_info = "large-smart"
-docs_attach = "large-smart"
-task_check = "large-smart"
+master_report = "small-smart"
+project_info = "small-smart"
+docs_attach = "small-smart"
+task_check = "small-smart"
 worker_implementor = "large-smart"
 worker_auditor = "large-smart"
 worker_test_writer = "large-smart"
