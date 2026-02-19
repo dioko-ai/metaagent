@@ -2033,11 +2033,6 @@ fn persist_planner_markdown_if_possible(app: &mut App, session_store: Option<&Se
     }
 }
 
-fn capture_tasks_baseline(session_store: &SessionStore) -> Option<TaskWriteBaseline> {
-    let tasks_json = std::fs::read_to_string(session_store.tasks_file()).ok()?;
-    Some(TaskWriteBaseline { tasks_json })
-}
-
 fn tasks_changed_since_baseline(before: Option<&str>, after: Option<&str>) -> bool {
     match (before, after) {
         (Some(before), Some(after)) => before != after,
