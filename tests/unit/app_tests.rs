@@ -360,14 +360,15 @@ fn worker_completion_updates_chat_and_tree() {
     assert!(!new_entries.is_empty());
 
     let started = app.start_next_worker_job().expect("second job");
-    assert_eq!(started.role, WorkerRole::TestWriter);
-    app.on_worker_output("Added tests".to_string());
+    assert_eq!(started.role, WorkerRole::Auditor);
+    app.on_worker_output("AUDIT_RESULT: PASS".to_string());
+    app.on_worker_output("No issues found".to_string());
     let new_entries = app.on_worker_completed(true, 0);
     assert!(!new_entries.is_empty());
 
     let started = app.start_next_worker_job().expect("third job");
-    assert_eq!(started.role, WorkerRole::Auditor);
-    app.on_worker_output("No issues found".to_string());
+    assert_eq!(started.role, WorkerRole::TestWriter);
+    app.on_worker_output("Added tests".to_string());
     app.on_worker_completed(true, 0);
 
     let started = app.start_next_worker_job().expect("fourth job");

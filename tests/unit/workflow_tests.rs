@@ -236,15 +236,15 @@ fn complete_non_final_branches_and_start_final_audit(wf: &mut Workflow) -> Start
     wf.append_active_output("implemented".to_string());
     wf.finish_active_job(true, 0);
 
-    let test_writer = wf.start_next_job().expect("test writer");
-    assert_eq!(test_writer.role, WorkerRole::TestWriter);
-    wf.append_active_output("wrote tests".to_string());
-    wf.finish_active_job(true, 0);
-
     let auditor = wf.start_next_job().expect("auditor");
     assert_eq!(auditor.role, WorkerRole::Auditor);
     wf.append_active_output("AUDIT_RESULT: PASS".to_string());
     wf.append_active_output("No issues found".to_string());
+    wf.finish_active_job(true, 0);
+
+    let test_writer = wf.start_next_job().expect("test writer");
+    assert_eq!(test_writer.role, WorkerRole::TestWriter);
+    wf.append_active_output("wrote tests".to_string());
     wf.finish_active_job(true, 0);
 
     let runner = wf.start_next_job().expect("test runner");
@@ -386,7 +386,7 @@ fn execution_queues_implementor_and_test_writer_jobs() {
     wf.finish_active_job(true, 0);
 
     let second = wf.start_next_job().expect("second job should start");
-    assert_eq!(second.role, WorkerRole::TestWriter);
+    assert_eq!(second.role, WorkerRole::Auditor);
     assert!(matches!(second.run, JobRun::AgentPrompt(_)));
 }
 
@@ -648,13 +648,14 @@ fn deterministic_test_runner_loops_back_to_test_writer_on_failure() {
     wf.append_active_output("implemented".to_string());
     wf.finish_active_job(true, 0);
 
-    let _ = wf.start_next_job().expect("test writer");
-    wf.append_active_output("wrote tests".to_string());
-    wf.finish_active_job(true, 0);
-
     let auditor = wf.start_next_job().expect("auditor");
     assert_eq!(auditor.role, WorkerRole::Auditor);
+    wf.append_active_output("AUDIT_RESULT: PASS".to_string());
     wf.append_active_output("No issues found".to_string());
+    wf.finish_active_job(true, 0);
+
+    let _ = wf.start_next_job().expect("test writer");
+    wf.append_active_output("wrote tests".to_string());
     wf.finish_active_job(true, 0);
 
     let runner = wf.start_next_job().expect("test runner");
@@ -685,14 +686,14 @@ fn missing_test_command_keeps_required_test_runner_branch_incomplete() {
     wf.append_active_output("implemented".to_string());
     wf.finish_active_job(true, 0);
 
-    let _ = wf.start_next_job().expect("test writer");
-    wf.append_active_output("wrote tests".to_string());
-    wf.finish_active_job(true, 0);
-
     let auditor = wf.start_next_job().expect("auditor");
     assert_eq!(auditor.role, WorkerRole::Auditor);
     wf.append_active_output("AUDIT_RESULT: PASS".to_string());
     wf.append_active_output("No issues found".to_string());
+    wf.finish_active_job(true, 0);
+
+    let _ = wf.start_next_job().expect("test writer");
+    wf.append_active_output("wrote tests".to_string());
     wf.finish_active_job(true, 0);
 
     let runner = wf.start_next_job().expect("test runner");
@@ -1048,13 +1049,6 @@ fn started_jobs_keep_same_parent_context_key_per_branch() {
     wf.append_active_output("implemented".to_string());
     wf.finish_active_job(true, 0);
 
-    let test_writer = wf.start_next_job().expect("test writer");
-    let tw_key = test_writer
-        .parent_context_key
-        .expect("test writer context key");
-    wf.append_active_output("wrote tests".to_string());
-    wf.finish_active_job(true, 0);
-
     let auditor = wf.start_next_job().expect("auditor");
     let auditor_key = auditor
         .parent_context_key
@@ -1063,11 +1057,6 @@ fn started_jobs_keep_same_parent_context_key_per_branch() {
     assert_ne!(auditor_key, impl_key);
     wf.append_active_output("AUDIT_RESULT: FAIL".to_string());
     wf.append_active_output("Fix needed".to_string());
-    wf.finish_active_job(true, 0);
-
-    let runner = wf.start_next_job().expect("test runner");
-    assert_eq!(runner.parent_context_key.as_deref(), Some(tw_key.as_str()));
-    wf.append_active_output("all passed".to_string());
     wf.finish_active_job(true, 0);
 
     let implementor_retry = wf.start_next_job().expect("implementor retry");
@@ -1083,6 +1072,19 @@ fn started_jobs_keep_same_parent_context_key_per_branch() {
         auditor_retry.parent_context_key.as_deref(),
         Some(auditor_key.as_str())
     );
+    wf.append_active_output("AUDIT_RESULT: PASS".to_string());
+    wf.append_active_output("No issues found".to_string());
+    wf.finish_active_job(true, 0);
+
+    let test_writer = wf.start_next_job().expect("test writer");
+    let tw_key = test_writer
+        .parent_context_key
+        .expect("test writer context key");
+    wf.append_active_output("wrote tests".to_string());
+    wf.finish_active_job(true, 0);
+
+    let runner = wf.start_next_job().expect("test runner");
+    assert_eq!(runner.parent_context_key.as_deref(), Some(tw_key.as_str()));
 }
 
 #[test]
@@ -1158,20 +1160,11 @@ fn auditor_output_is_forwarded_to_implementor_retry_prompt() {
     wf.append_active_output("implemented".to_string());
     wf.finish_active_job(true, 0);
 
-    let _ = wf.start_next_job().expect("test writer");
-    wf.append_active_output("wrote tests".to_string());
-    wf.finish_active_job(true, 0);
-
     let auditor = wf.start_next_job().expect("auditor");
     assert_eq!(auditor.role, WorkerRole::Auditor);
     wf.append_active_output("Issue: missing edge-case handling".to_string());
     let messages = wf.finish_active_job(true, 0);
     assert!(messages.iter().any(|m| m.contains("audit requested fixes")));
-
-    let runner = wf.start_next_job().expect("test runner");
-    assert_eq!(runner.role, WorkerRole::TestRunner);
-    wf.append_active_output("all passed".to_string());
-    wf.finish_active_job(true, 0);
 
     let retry = wf.start_next_job().expect("implementor retry");
     assert_eq!(retry.role, WorkerRole::Implementor);
@@ -1200,10 +1193,6 @@ fn implementor_changed_files_summary_is_forwarded_to_auditor_prompt() {
         "- src/ui.rs: updated rendering path for task block layout".to_string(),
     );
     wf.append_active_output("FILES_CHANGED_END".to_string());
-    wf.finish_active_job(true, 0);
-
-    let _ = wf.start_next_job().expect("test writer");
-    wf.append_active_output("Wrote tests".to_string());
     wf.finish_active_job(true, 0);
 
     let auditor = wf.start_next_job().expect("auditor");
@@ -1272,10 +1261,6 @@ fn audit_retry_limit_stops_after_four_failed_audits() {
     wf.append_active_output("implemented v1".to_string());
     wf.finish_active_job(true, 0);
 
-    let _ = wf.start_next_job().expect("test writer");
-    wf.append_active_output("wrote tests".to_string());
-    wf.finish_active_job(true, 0);
-
     let mut last_messages = Vec::new();
     for audit_pass in 1..=4 {
         let auditor = wf.start_next_job().expect("auditor");
@@ -1293,13 +1278,6 @@ fn audit_retry_limit_stops_after_four_failed_audits() {
         wf.append_active_output("Critical blocker still present".to_string());
         last_messages = wf.finish_active_job(true, 0);
 
-        if audit_pass == 1 {
-            let runner = wf.start_next_job().expect("test runner");
-            assert_eq!(runner.role, WorkerRole::TestRunner);
-            wf.append_active_output("all passed".to_string());
-            wf.finish_active_job(true, 0);
-        }
-
         if audit_pass < 4 {
             let implementor = wf.start_next_job().expect("implementor retry");
             assert_eq!(implementor.role, WorkerRole::Implementor);
@@ -1311,8 +1289,19 @@ fn audit_retry_limit_stops_after_four_failed_audits() {
     assert!(
         last_messages
             .iter()
-            .any(|m| m.contains(&format!("Max retries ({MAX_FINAL_AUDIT_RETRIES}) reached")))
+            .any(|m| m.contains(&format!("Max retries ({MAX_AUDIT_RETRIES}) reached")))
     );
+
+    let writer = wf.start_next_job().expect("test writer after audit exhaustion");
+    assert_eq!(writer.role, WorkerRole::TestWriter);
+    wf.append_active_output("wrote tests after exhausted audit".to_string());
+    wf.finish_active_job(true, 0);
+
+    let runner = wf.start_next_job().expect("test runner after audit exhaustion");
+    assert_eq!(runner.role, WorkerRole::TestRunner);
+    wf.append_active_output("all passed".to_string());
+    wf.finish_active_job(true, 0);
+
     assert!(wf.start_next_job().is_none());
     let tree = wf.right_pane_lines().join("\n");
     assert!(tree.contains("[x] Task: Do work"));
@@ -2215,9 +2204,6 @@ fn implementor_and_auditor_prompts_include_test_guardrails() {
 
     wf.append_active_output("implemented".to_string());
     wf.finish_active_job(true, 0);
-    let _ = wf.start_next_job().expect("test writer");
-    wf.append_active_output("tests".to_string());
-    wf.finish_active_job(true, 0);
     let auditor = wf.start_next_job().expect("auditor");
     match auditor.run {
         JobRun::AgentPrompt(prompt) => {
@@ -2537,6 +2523,201 @@ fn start_execution_resumes_with_in_progress_implementor_and_pending_auditor_subt
     let started = wf.start_next_job().expect("should resume pending auditor");
     assert_eq!(started.role, WorkerRole::Auditor);
     match started.run {
+        JobRun::AgentPrompt(prompt) => {
+            assert!(prompt.contains("reviewing implementation output"));
+        }
+        JobRun::DeterministicTestRun => panic!("expected auditor prompt"),
+    }
+}
+
+#[test]
+fn first_implementor_pass_enqueues_implementor_auditor_before_test_writer() {
+    let mut wf = Workflow::default();
+    wf.sync_planner_tasks_from_file(vec![
+        PlannerTaskFileEntry {
+            id: "top".to_string(),
+            title: "Task".to_string(),
+            details: "top details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Task,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: None,
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "impl".to_string(),
+            title: "Implementation".to_string(),
+            details: "impl details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Implementor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "impl-audit".to_string(),
+            title: "Audit".to_string(),
+            details: "audit details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Auditor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("impl".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "impl-runner".to_string(),
+            title: "Run tests".to_string(),
+            details: "runner details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::TestRunner,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("impl".to_string()),
+            order: Some(1),
+        },
+        PlannerTaskFileEntry {
+            id: "tw".to_string(),
+            title: "Write tests".to_string(),
+            details: "test writer details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::TestWriter,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top".to_string()),
+            order: Some(1),
+        },
+        PlannerTaskFileEntry {
+            id: "tw-runner".to_string(),
+            title: "Run tests".to_string(),
+            details: "test runner details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::TestRunner,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("tw".to_string()),
+            order: Some(0),
+        },
+    ])
+    .expect("sync should succeed");
+
+    wf.start_execution();
+    let first = wf.start_next_job().expect("implementor");
+    assert_eq!(first.role, WorkerRole::Implementor);
+    wf.append_active_output("implemented".to_string());
+    wf.finish_active_job(true, 0);
+
+    let second = wf.start_next_job().expect("implementor auditor");
+    assert_eq!(second.role, WorkerRole::Auditor);
+    wf.append_active_output("AUDIT_RESULT: PASS".to_string());
+    wf.append_active_output("looks good".to_string());
+    wf.finish_active_job(true, 0);
+
+    let third = wf.start_next_job().expect("implementor test runner");
+    assert_eq!(third.role, WorkerRole::TestRunner);
+}
+
+#[test]
+fn resume_does_not_mark_task_done_with_pending_implementor_auditor() {
+    let mut wf = Workflow::default();
+    wf.sync_planner_tasks_from_file(vec![
+        PlannerTaskFileEntry {
+            id: "top-a".to_string(),
+            title: "Top A".to_string(),
+            details: "top A details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Task,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: None,
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "top-a-impl".to_string(),
+            title: "Top A implementation".to_string(),
+            details: "top A implementation".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Implementor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top-a".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "top-a-audit".to_string(),
+            title: "Top A audit".to_string(),
+            details: "top A audit".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Auditor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top-a-impl".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "top-a-tw".to_string(),
+            title: "Top A write tests".to_string(),
+            details: "top A test writer details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::TestWriter,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top-a".to_string()),
+            order: Some(1),
+        },
+        PlannerTaskFileEntry {
+            id: "top-a-tw-runner".to_string(),
+            title: "Top A run tests".to_string(),
+            details: "top A test runner details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::TestRunner,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top-a-tw".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "top-b".to_string(),
+            title: "Top B".to_string(),
+            details: "top B details".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Task,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: None,
+            order: Some(1),
+        },
+        PlannerTaskFileEntry {
+            id: "top-b-impl".to_string(),
+            title: "Top B implementation".to_string(),
+            details: "top B implementation".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Implementor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top-b".to_string()),
+            order: Some(0),
+        },
+        PlannerTaskFileEntry {
+            id: "top-b-audit".to_string(),
+            title: "Top B audit".to_string(),
+            details: "top B audit".to_string(),
+            docs: Vec::new(),
+            kind: PlannerTaskKindFile::Auditor,
+            status: PlannerTaskStatusFile::Pending,
+            parent_id: Some("top-b-impl".to_string()),
+            order: Some(0),
+        },
+    ])
+    .expect("sync should succeed");
+
+    wf.start_execution();
+    let _ = wf.start_next_job().expect("top A implementor");
+    wf.append_active_output("implemented".to_string());
+    wf.finish_active_job(true, 0);
+
+    let snapshot = wf.planner_tasks_for_file();
+    let top_status = snapshot
+        .iter()
+        .find(|entry| entry.id == "top-a")
+        .map(|entry| entry.status);
+    assert_ne!(top_status, Some(PlannerTaskStatusFile::Done));
+
+    let mut resumed = Workflow::default();
+    resumed.sync_planner_tasks_from_file(snapshot).expect("reload should succeed");
+    resumed.start_execution();
+    let next = resumed.start_next_job().expect("next job should resume pending work on top A");
+    assert_eq!(next.role, WorkerRole::Auditor);
+    match next.run {
         JobRun::AgentPrompt(prompt) => {
             assert!(prompt.contains("reviewing implementation output"));
         }

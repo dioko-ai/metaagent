@@ -1203,6 +1203,22 @@ impl Workflow {
                 return queued;
             }
 
+            if self.branch_has_active_or_queued(*top_id, TaskKind::Implementor) {
+                return queued;
+            }
+
+            let queued_next_impl_step = self.queue_next_implementor_audit(
+                *top_id,
+                implementor_id,
+                1,
+                None,
+                None,
+                &mut on_completion_messages,
+            );
+            if queued_next_impl_step {
+                return queued;
+            }
+
             if has_top_level_test_writer {
                 if let Some(test_writer_id) =
                     self.find_next_pending_child_kind(*top_id, TaskKind::TestWriter)
@@ -1223,22 +1239,6 @@ impl Workflow {
                     }
                     return queued;
                 }
-            }
-
-            if self.branch_has_active_or_queued(*top_id, TaskKind::Implementor) {
-                return queued;
-            }
-
-            let queued_next = self.queue_next_implementor_audit(
-                *top_id,
-                implementor_id,
-                1,
-                None,
-                None,
-                &mut on_completion_messages,
-            );
-            if queued_next {
-                return queued;
             }
             // No additional work was enqueued for this top; allow scanning subsequent top-level
             // tasks (including final-audit scheduling) when non-final work is complete.
@@ -1451,13 +1451,13 @@ impl Workflow {
                 .children
                 .iter()
                 .filter(|child| child.kind == TaskKind::Implementor)
-                .all(|node| node.status == TaskStatus::Done);
+                .all(|node| Self::subtree_done(node));
             let requires_test_writer = top.children.iter().any(|c| c.kind == TaskKind::TestWriter);
             let test_done = if requires_test_writer {
                 top.children
                     .iter()
                     .filter(|child| child.kind == TaskKind::TestWriter)
-                    .all(|node| node.status == TaskStatus::Done)
+                    .all(|node| Self::subtree_done(node))
             } else {
                 true
             };
@@ -1475,6 +1475,13 @@ impl Workflow {
                 top_task_id
             ));
         }
+    }
+
+    fn subtree_done(node: &TaskNode) -> bool {
+        if node.status != TaskStatus::Done {
+            return false;
+        }
+        node.children.iter().all(Self::subtree_done)
     }
 
     fn push_context(&mut self, entry: String) {
