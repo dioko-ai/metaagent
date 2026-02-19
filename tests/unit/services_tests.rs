@@ -159,6 +159,116 @@ fn dispatch_agent_prompt_preserves_prior_worker_session_id() {
 }
 
 #[test]
+fn dispatch_agent_prompt_keeps_existing_context_and_creates_new_context_for_future_dispatches() {
+    let service = DefaultCoreOrchestrationService;
+    let (store, session_dir) = open_temp_store("metaagent-services-dispatch-future");
+    let mut adapters = std::collections::HashMap::new();
+    let existing_adapter = crate::agent::CodexAdapter::new_persistent();
+    existing_adapter.set_saved_session_id(Some("session-123".to_string()));
+    adapters.insert("implementor:1".to_string(), existing_adapter);
+
+    let mut active_key = None;
+    let test_runner = TestRunnerAdapter::new();
+    let mut routing = CodexAgentModelRouting::default();
+
+    let first_job = StartedJob {
+        run: JobRun::AgentPrompt("first".to_string()),
+        role: WorkerRole::Implementor,
+        top_task_id: 1,
+        parent_context_key: Some("implementor:1".to_string()),
+    };
+    service.dispatch_worker_job(
+        &first_job,
+        &mut adapters,
+        &mut active_key,
+        &test_runner,
+        &store,
+        &routing,
+    );
+    assert_eq!(active_key.as_deref(), Some("implementor:1"));
+
+    routing =
+        CodexAgentModelRouting::from_toml_str("[backend]\nselected = \"claude\"\n").unwrap_or_default();
+    let second_job = StartedJob {
+        run: JobRun::AgentPrompt("second".to_string()),
+        role: WorkerRole::Implementor,
+        top_task_id: 2,
+        parent_context_key: Some("implementor:2".to_string()),
+    };
+    service.dispatch_worker_job(
+        &second_job,
+        &mut adapters,
+        &mut active_key,
+        &test_runner,
+        &store,
+        &routing,
+    );
+
+    assert_eq!(active_key.as_deref(), Some("implementor:2"));
+    assert_eq!(adapters.len(), 2);
+    assert_eq!(
+        adapters
+            .get("implementor:1")
+            .expect("original adapter should remain")
+            .saved_session_id()
+            .as_deref(),
+        Some("session-123")
+    );
+    assert_eq!(
+        adapters
+            .get("implementor:2")
+            .expect("new adapter should be created for new context")
+            .saved_session_id(),
+        None
+    );
+
+    let _ = std::fs::remove_dir_all(&session_dir);
+}
+
+#[test]
+fn dispatch_agent_prompt_does_not_replace_in_flight_context_adapter_after_backend_change() {
+    let service = DefaultCoreOrchestrationService;
+    let (store, session_dir) = open_temp_store("metaagent-services-dispatch-in-flight");
+    let mut adapters = std::collections::HashMap::new();
+    let existing_adapter = crate::agent::CodexAdapter::new_persistent();
+    existing_adapter.set_saved_session_id(Some("session-123".to_string()));
+    adapters.insert("implementor:1".to_string(), existing_adapter);
+
+    let mut active_key = None;
+    let test_runner = TestRunnerAdapter::new();
+    let routing =
+        CodexAgentModelRouting::from_toml_str("[backend]\nselected = \"claude\"\n").unwrap_or_default();
+
+    let job = StartedJob {
+        run: JobRun::AgentPrompt("continue same context".to_string()),
+        role: WorkerRole::Implementor,
+        top_task_id: 1,
+        parent_context_key: Some("implementor:1".to_string()),
+    };
+    service.dispatch_worker_job(
+        &job,
+        &mut adapters,
+        &mut active_key,
+        &test_runner,
+        &store,
+        &routing,
+    );
+
+    assert_eq!(active_key.as_deref(), Some("implementor:1"));
+    assert_eq!(adapters.len(), 1);
+    assert_eq!(
+        adapters
+            .get("implementor:1")
+            .expect("existing adapter should still be used")
+            .saved_session_id()
+            .as_deref(),
+        Some("session-123")
+    );
+
+    let _ = std::fs::remove_dir_all(&session_dir);
+}
+
+#[test]
 fn dispatch_deterministic_test_run_uses_trimmed_meta_test_command() {
     let service = DefaultCoreOrchestrationService;
     let (store, session_dir) = open_temp_store("metaagent-services-dispatch-test");

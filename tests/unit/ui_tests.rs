@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::BackendKind;
 use crate::app::RightPaneMode;
 use crate::session_store::{PlannerTaskFileEntry, PlannerTaskKindFile, PlannerTaskStatusFile};
 use ratatui::Terminal;
@@ -146,6 +147,75 @@ fn render_shows_resume_picker_overlay_when_open() {
     let text = render_text(&app, 120, 30);
     assert!(text.contains("Resume Session"));
     assert!(text.contains("Session A"));
+}
+
+#[test]
+fn render_shows_backend_picker_overlay_when_open() {
+    let mut app = App::default();
+    app.open_backend_picker(vec![
+        crate::app::BackendOption {
+            kind: BackendKind::Codex,
+            label: "Codex CLI",
+            description: "Run codex locally",
+        },
+        crate::app::BackendOption {
+            kind: BackendKind::Claude,
+            label: "Claude CLI",
+            description: "Run claude locally",
+        },
+    ]);
+
+    let text = render_text(&app, 120, 30);
+    assert!(text.contains("Select Backend"));
+    assert!(text.contains("Codex CLI"));
+    assert!(text.contains("(Up/Down select, Enter/Space choose)"));
+}
+
+#[test]
+fn render_backend_picker_overlay_tracks_selected_option() {
+    let mut app = App::default();
+    app.open_backend_picker(vec![
+        crate::app::BackendOption {
+            kind: BackendKind::Codex,
+            label: "Codex CLI",
+            description: "Run codex locally",
+        },
+        crate::app::BackendOption {
+            kind: BackendKind::Claude,
+            label: "Claude CLI",
+            description: "Run claude locally",
+        },
+    ]);
+
+    let initial = render_text(&app, 120, 30);
+    assert!(initial.contains("> Codex CLI"));
+
+    app.backend_picker_move_down();
+    let after_move = render_text(&app, 120, 30);
+    assert!(!after_move.contains("> Codex CLI"));
+    assert!(after_move.contains("> Claude CLI"));
+}
+
+#[test]
+fn render_backend_picker_overlay_replaces_resume_picker_overlay() {
+    let mut app = App::default();
+    app.open_resume_picker(vec![crate::app::ResumeSessionOption {
+        session_dir: "/tmp/session-a".to_string(),
+        workspace: "/tmp/work-a".to_string(),
+        title: Some("Session A".to_string()),
+        created_at_label: Some("2026-02-16T12:00:00Z".to_string()),
+        last_used_epoch_secs: 100,
+    }]);
+    app.open_backend_picker(vec![crate::app::BackendOption {
+        kind: BackendKind::Codex,
+        label: "Codex CLI",
+        description: "Run codex locally",
+    }]);
+
+    let text = render_text(&app, 120, 30);
+    assert!(text.contains("Select Backend"));
+    assert!(!text.contains("Resume Session"));
+    assert!(!text.contains("Session A"));
 }
 
 #[test]

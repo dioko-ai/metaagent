@@ -21,6 +21,30 @@ fn default_codex_config_is_unsandboxed_for_this_version() {
 }
 
 #[test]
+fn default_claude_config_uses_claude_backend_defaults() {
+    let config = CodexCommandConfig::default_for_backend(BackendKind::Claude);
+    assert_eq!(config.program, "claude");
+    assert_eq!(
+        config.args_prefix,
+        vec!["--dangerously-skip-permissions".to_string()]
+    );
+    assert_eq!(config.output_mode, AdapterOutputMode::PlainText);
+    assert!(!config.persistent_session);
+    assert!(config.model.is_none());
+    assert!(config.model_reasoning_effort.is_none());
+}
+
+#[test]
+fn backend_kind_detects_claude_from_program_name() {
+    let mut config = CodexCommandConfig::default();
+    config.program = "/usr/local/bin/claude-code".to_string();
+    assert_eq!(config.backend_kind(), BackendKind::Claude);
+
+    config.program = "/usr/local/bin/codex".to_string();
+    assert_eq!(config.backend_kind(), BackendKind::Codex);
+}
+
+#[test]
 fn master_config_enables_persistent_session() {
     let adapter = CodexAdapter::new_master();
     assert!(adapter.config.persistent_session);
@@ -120,6 +144,61 @@ fn resume_args_keep_model_and_reasoning_effort() {
     assert!(
         args.windows(2)
             .any(|pair| pair[0] == "-c" && pair[1] == "model_reasoning_effort=\"xhigh\"")
+    );
+}
+
+#[test]
+fn codex_resume_prompt_args_keep_exec_resume_parity() {
+    let config = CodexCommandConfig::default();
+    let args = build_resume_prompt_args(&config, "session-123");
+    assert_eq!(
+        args,
+        vec![
+            "exec".to_string(),
+            "resume".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            "session-123".to_string()
+        ]
+    );
+}
+
+#[test]
+fn claude_new_session_args_include_prompt_and_json_flags() {
+    let mut config = CodexCommandConfig::default_for_backend(BackendKind::Claude);
+    config.output_mode = AdapterOutputMode::JsonAssistantOnly;
+    config.model = Some("claude-sonnet-4.5".to_string());
+    let args = build_new_session_args(&config);
+    assert_eq!(
+        args,
+        vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--model".to_string(),
+            "claude-sonnet-4.5".to_string(),
+            "-p".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn claude_resume_prompt_args_use_resume_flag() {
+    let mut config = CodexCommandConfig::default_for_backend(BackendKind::Claude);
+    config.output_mode = AdapterOutputMode::JsonAssistantOnly;
+    config.model = Some("claude-sonnet-4.5".to_string());
+    let args = build_resume_prompt_args(&config, "thread-abc");
+    assert_eq!(
+        args,
+        vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--model".to_string(),
+            "claude-sonnet-4.5".to_string(),
+            "--resume".to_string(),
+            "thread-abc".to_string(),
+            "-p".to_string(),
+        ]
     );
 }
 
@@ -317,6 +396,40 @@ fn adapter_spawn_error_still_emits_completed_event() {
     assert!(
         saw_completed,
         "expected completed event even when process spawn fails"
+    );
+}
+
+#[test]
+fn claude_backend_spawn_error_still_emits_completed_event() {
+    let adapter = CodexAdapter::with_config(CodexCommandConfig {
+        program: "__no_such_claude_binary__".to_string(),
+        args_prefix: Vec::new(),
+        output_mode: AdapterOutputMode::PlainText,
+        persistent_session: false,
+        model: Some("claude-sonnet-4.5".to_string()),
+        model_reasoning_effort: Some("high".to_string()),
+    });
+    adapter.send_prompt("hello".to_string());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut saw_completed = false;
+    while Instant::now() < deadline {
+        for event in adapter.drain_events() {
+            if let AgentEvent::Completed { success, code } = event {
+                assert!(!success);
+                assert_eq!(code, -1);
+                saw_completed = true;
+            }
+        }
+        if saw_completed {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        saw_completed,
+        "expected completed event even when Claude process spawn fails"
     );
 }
 

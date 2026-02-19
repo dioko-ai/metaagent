@@ -1,6 +1,19 @@
 [storage]
 root_dir = "~/.metaagent/sessions"
 
+# Default backend routing for newly created adapters.
+# Runtime `/backend` updates persist this value to ~/.metaagent/config.toml.
+[backend]
+selected = "codex"
+
+[backend.codex]
+program = "codex"
+args_prefix = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--color", "never"]
+
+[backend.claude]
+program = "claude"
+args_prefix = ["--dangerously-skip-permissions"]
+
 [codex.model_profiles.small-dumb]
 model = "gpt-5.1-codex-mini"
 thinking_effort = "low"

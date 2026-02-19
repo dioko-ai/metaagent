@@ -29,6 +29,7 @@ References:
 | Read/append task failure ledger | `api session read-task-fails --session-dir <path> [--cwd <path>]`, `api session append-task-fails --session-dir <path> --entries-file <json> [--cwd <path>]` | Full | CLI parity for durable workflow failure records. |
 | Read/write project info context | `api session read-project-info --session-dir <path> [--cwd <path>]`, `api session write-project-info --session-dir <path> --markdown-file <path> [--cwd <path>]` | Full | CLI parity for project context consumed by subagent prompts. |
 | Read session metadata | `api session read-session-meta --session-dir <path> [--cwd <path>]` | Full | CLI access to session title/created/test-command metadata. |
+| Choose backend (`/backend`) | _No direct CLI command yet_ | Gap | TUI picker updates `~/.metaagent/config.toml` (`[backend].selected`); selection affects newly created adapters only. |
 | Start execution (`/start`, `/run`) | _No CLI command yet_ | Gap | TUI-only orchestration trigger in this transport pass. |
 | Live terminal event loop (chat input, pane nav, scrolling) | _No CLI command_ | Intentional gap | Interactive TUI behavior is not exposed as one-shot CLI commands. |
 | Slash task-edit controls (`/split-audits`, `/merge-audits`, `/split-tests`, `/merge-tests`, `/add-final-audit`, `/remove-final-audit`) | _No direct CLI command yet_ | Gap | Only accessible through interactive message command flow currently. |

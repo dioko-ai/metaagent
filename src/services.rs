@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent::CodexAdapter;
+use crate::agent::{BackendKind, CodexAdapter};
 use crate::agent_models::{CodexAgentKind, CodexAgentModelRouting};
 use crate::app::App;
 use crate::artifact_io::{read_text_file, write_text_file};
@@ -128,12 +128,9 @@ impl CoreOrchestrationService for DefaultCoreOrchestrationService {
                     .parent_context_key
                     .clone()
                     .unwrap_or_else(|| format!("top:{}", job.top_task_id));
-                let prior_session_id = worker_agent_adapters
-                    .remove(&key)
-                    .and_then(|adapter| adapter.saved_session_id());
-                let adapter = build_worker_adapter(model_routing, job.role);
-                adapter.set_saved_session_id(prior_session_id);
-                worker_agent_adapters.insert(key.clone(), adapter);
+                worker_agent_adapters
+                    .entry(key.clone())
+                    .or_insert_with(|| build_worker_adapter(model_routing, job.role));
                 let adapter = worker_agent_adapters
                     .get(&key)
                     .expect("worker adapter should be present after insertion");
@@ -368,12 +365,17 @@ fn worker_role_agent_kind(role: WorkerRole) -> CodexAgentKind {
 }
 
 fn build_worker_adapter(model_routing: &CodexAgentModelRouting, role: WorkerRole) -> CodexAdapter {
-    let mut config = crate::agent::CodexCommandConfig::default();
+    let mut config = model_routing.base_command_config();
     config.output_mode = crate::agent::AdapterOutputMode::PlainText;
     config.persistent_session = true;
     let profile = model_routing.profile_for(worker_role_agent_kind(role));
-    config.model = Some(profile.model.clone());
-    config.model_reasoning_effort = profile.thinking_effort;
+    if matches!(config.backend_kind(), BackendKind::Codex) {
+        config.model = Some(profile.model.clone());
+        config.model_reasoning_effort = profile.thinking_effort;
+    } else {
+        config.model = None;
+        config.model_reasoning_effort = None;
+    }
     CodexAdapter::with_config(config)
 }
 

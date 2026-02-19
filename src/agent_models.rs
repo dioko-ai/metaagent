@@ -3,7 +3,8 @@ use std::io;
 
 use serde::Deserialize;
 
-use crate::artifact_io::{ensure_default_metaagent_config, read_text_file};
+use crate::agent::{BackendKind, CodexCommandConfig};
+use crate::artifact_io::load_merged_metaagent_config_text;
 use crate::default_config::DEFAULT_CONFIG_TOML;
 
 pub const DEFAULT_PROFILE_LABEL: &str = "large-smart";
@@ -48,6 +49,7 @@ pub enum CodexAgentKind {
 pub struct CodexAgentModelRouting {
     profiles: HashMap<String, CodexModelProfile>,
     agent_profiles: AgentProfileAssignments,
+    base_command: CodexCommandConfig,
 }
 
 impl Default for CodexAgentModelRouting {
@@ -58,11 +60,8 @@ impl Default for CodexAgentModelRouting {
 
 impl CodexAgentModelRouting {
     pub fn load_from_metaagent_config() -> io::Result<Self> {
-        let default_config = parse_config(DEFAULT_CONFIG_TOML)?;
-        let path = ensure_default_metaagent_config()?;
-        let text = read_text_file(&path)?;
-        let override_config = parse_config(&text)?;
-        Ok(Self::from_merged_config(default_config, override_config))
+        let text = load_merged_metaagent_config_text()?;
+        Self::from_toml_str(&text)
     }
 
     pub fn from_toml_str(text: &str) -> io::Result<Self> {
@@ -80,12 +79,20 @@ impl CodexAgentModelRouting {
             .unwrap_or_else(default_large_smart_profile)
     }
 
-    fn from_merged_config(base: MetaAgentConfigFile, override_cfg: MetaAgentConfigFile) -> Self {
-        let merged_codex = base.codex.merged_with(override_cfg.codex);
-        Self::from_codex_config(merged_codex)
+    pub fn base_command_config(&self) -> CodexCommandConfig {
+        self.base_command.clone()
     }
 
-    fn from_codex_config(config: CodexModelConfigFile) -> Self {
+    fn from_merged_config(base: MetaAgentConfigFile, override_cfg: MetaAgentConfigFile) -> Self {
+        let merged_backend = base.backend.merged_with(override_cfg.backend);
+        let merged_codex = base.codex.merged_with(override_cfg.codex);
+        Self::from_merged_runtime_config(merged_backend, merged_codex)
+    }
+
+    fn from_merged_runtime_config(
+        backend: BackendSelectionConfigFile,
+        config: CodexModelConfigFile,
+    ) -> Self {
         let mut profiles = HashMap::new();
         for (label, profile) in config.model_profiles {
             let Some(parsed_profile) = CodexModelProfile::from_config(profile) else {
@@ -96,6 +103,7 @@ impl CodexAgentModelRouting {
         Self {
             profiles,
             agent_profiles: config.agent_profiles.into_runtime(),
+            base_command: backend.into_runtime(),
         }
     }
 
@@ -108,6 +116,7 @@ impl CodexAgentModelRouting {
         Self {
             profiles,
             agent_profiles: AgentProfileAssignments::default(),
+            base_command: CodexCommandConfig::default(),
         }
     }
 }
@@ -115,7 +124,81 @@ impl CodexAgentModelRouting {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct MetaAgentConfigFile {
+    backend: BackendSelectionConfigFile,
     codex: CodexModelConfigFile,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct BackendSelectionConfigFile {
+    selected: Option<String>,
+    codex: BackendCommandConfigFile,
+    claude: BackendCommandConfigFile,
+}
+
+impl BackendSelectionConfigFile {
+    fn merged_with(self, override_cfg: Self) -> Self {
+        Self {
+            selected: override_cfg.selected.or(self.selected),
+            codex: self.codex.merged_with(override_cfg.codex),
+            claude: self.claude.merged_with(override_cfg.claude),
+        }
+    }
+
+    fn into_runtime(self) -> CodexCommandConfig {
+        let selected = self
+            .selected
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("codex")
+            .to_ascii_lowercase();
+        let backend_kind = if selected == "claude" {
+            BackendKind::Claude
+        } else {
+            BackendKind::Codex
+        };
+        let backend_config = match backend_kind {
+            BackendKind::Codex => self.codex,
+            BackendKind::Claude => self.claude,
+        };
+        backend_config.into_runtime(backend_kind)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct BackendCommandConfigFile {
+    program: Option<String>,
+    args_prefix: Option<Vec<String>>,
+}
+
+impl BackendCommandConfigFile {
+    fn merged_with(self, override_cfg: Self) -> Self {
+        Self {
+            program: override_cfg.program.or(self.program),
+            args_prefix: override_cfg.args_prefix.or(self.args_prefix),
+        }
+    }
+
+    fn into_runtime(self, backend_kind: BackendKind) -> CodexCommandConfig {
+        let mut config = CodexCommandConfig::default_for_backend(backend_kind);
+        if let Some(program) = self
+            .program
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            config.program = program.to_string();
+        }
+        if let Some(args_prefix) = self.args_prefix {
+            config.args_prefix = args_prefix
+                .into_iter()
+                .map(|arg| arg.trim().to_string())
+                .filter(|arg| !arg.is_empty())
+                .collect();
+        }
+        config
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

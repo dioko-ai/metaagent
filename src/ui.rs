@@ -40,8 +40,11 @@ pub fn chat_input_text_width(screen: Rect) -> u16 {
         Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(screen);
     let [left, _right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [_left_top, left_bottom] =
-        Layout::vertical([Constraint::Percentage(LEFT_TOP_PANE_PERCENT), Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT)]).areas(left);
+    let [_left_top, left_bottom] = Layout::vertical([
+        Constraint::Percentage(LEFT_TOP_PANE_PERCENT),
+        Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT),
+    ])
+    .areas(left);
     let [_title_bar, content] =
         Layout::vertical([Constraint::Length(TITLE_BAR_HEIGHT), Constraint::Min(0)])
             .areas(left_bottom);
@@ -53,8 +56,11 @@ pub fn chat_max_scroll(screen: Rect, app: &App) -> u16 {
         Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(screen);
     let [left, _right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [_left_top, left_bottom] =
-        Layout::vertical([Constraint::Percentage(LEFT_TOP_PANE_PERCENT), Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT)]).areas(left);
+    let [_left_top, left_bottom] = Layout::vertical([
+        Constraint::Percentage(LEFT_TOP_PANE_PERCENT),
+        Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT),
+    ])
+    .areas(left);
     let [_title_bar, content] =
         Layout::vertical([Constraint::Length(TITLE_BAR_HEIGHT), Constraint::Min(0)])
             .areas(left_bottom);
@@ -71,11 +77,9 @@ pub fn chat_max_scroll(screen: Rect, app: &App) -> u16 {
         Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).areas(content);
 
     let visible_message_lines = messages_area.height.saturating_sub(TEXT_PADDING * 2);
-    let total_message_lines = cached_chat_display_lines(
-        app,
-        content.width.saturating_sub(TEXT_PADDING * 2).max(1),
-    )
-    .len() as u16;
+    let total_message_lines =
+        cached_chat_display_lines(app, content.width.saturating_sub(TEXT_PADDING * 2).max(1)).len()
+            as u16;
     total_message_lines.saturating_sub(visible_message_lines)
 }
 
@@ -84,8 +88,11 @@ pub fn left_top_max_scroll(screen: Rect, app: &App) -> u16 {
         Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(screen);
     let [left, _right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [left_top, _left_bottom] =
-        Layout::vertical([Constraint::Percentage(LEFT_TOP_PANE_PERCENT), Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT)]).areas(left);
+    let [left_top, _left_bottom] = Layout::vertical([
+        Constraint::Percentage(LEFT_TOP_PANE_PERCENT),
+        Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT),
+    ])
+    .areas(left);
     let [_title_bar, content] =
         Layout::vertical([Constraint::Length(TITLE_BAR_HEIGHT), Constraint::Min(0)])
             .areas(left_top);
@@ -123,8 +130,11 @@ pub fn pane_hit_test(screen: Rect, x: u16, y: u16) -> Option<Pane> {
         Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(screen);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [left_top, left_bottom] =
-        Layout::vertical([Constraint::Percentage(LEFT_TOP_PANE_PERCENT), Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT)]).areas(left);
+    let [left_top, left_bottom] = Layout::vertical([
+        Constraint::Percentage(LEFT_TOP_PANE_PERCENT),
+        Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT),
+    ])
+    .areas(left);
 
     if point_in_rect(left_top, x, y) {
         return Some(Pane::LeftTop);
@@ -143,8 +153,11 @@ pub fn render(frame: &mut Frame, app: &App, theme: &Theme) {
         .areas(frame.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [left_top, left_bottom] =
-        Layout::vertical([Constraint::Percentage(LEFT_TOP_PANE_PERCENT), Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT)]).areas(left);
+    let [left_top, left_bottom] = Layout::vertical([
+        Constraint::Percentage(LEFT_TOP_PANE_PERCENT),
+        Constraint::Percentage(LEFT_BOTTOM_PANE_PERCENT),
+    ])
+    .areas(left);
 
     render_worker_output_pane(
         frame,
@@ -183,6 +196,8 @@ pub fn render(frame: &mut Frame, app: &App, theme: &Theme) {
 
     if app.is_resume_picker_open() {
         render_resume_picker(frame, app, theme);
+    } else if app.is_backend_picker_open() {
+        render_backend_picker(frame, app, theme);
     }
 }
 
@@ -306,8 +321,10 @@ fn render_chat_pane(frame: &mut Frame, area: Rect, app: &App, active: bool, them
     let [messages_area, input_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).areas(content);
 
-    let message_lines =
-        cached_chat_display_lines(app, messages_area.width.saturating_sub(TEXT_PADDING * 2).max(1));
+    let message_lines = cached_chat_display_lines(
+        app,
+        messages_area.width.saturating_sub(TEXT_PADDING * 2).max(1),
+    );
     let message_text = chat_text(message_lines.as_ref(), theme);
     let messages = Paragraph::new(message_text)
         .scroll((
@@ -491,6 +508,89 @@ fn render_resume_picker(frame: &mut Frame, app: &App, theme: &Theme) {
             Span::raw(" "),
             Span::styled(
                 format!("({when} | {})", item.workspace),
+                Style::default().fg(theme.muted_fg),
+            ),
+        ]));
+    }
+
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.input_bg))
+            .block(
+                Block::default()
+                    .style(Style::default().bg(theme.input_bg))
+                    .padding(Padding::uniform(TEXT_PADDING)),
+            ),
+        overlay,
+    );
+}
+
+fn render_backend_picker(frame: &mut Frame, app: &App, theme: &Theme) {
+    let entries = app.backend_picker_options();
+    if entries.is_empty() {
+        return;
+    }
+
+    let width = frame.area().width.min(90).max(40);
+    let max_rows = frame.area().height.saturating_sub(8).max(3);
+    let shown_count = (entries.len() as u16).min(max_rows.saturating_sub(2).max(1));
+    let height = shown_count
+        .saturating_add(4)
+        .min(frame.area().height.max(3));
+    let x = frame
+        .area()
+        .x
+        .saturating_add(frame.area().width.saturating_sub(width) / 2);
+    let y = frame
+        .area()
+        .y
+        .saturating_add(frame.area().height.saturating_sub(height) / 2);
+    let overlay = Rect::new(x, y, width, height);
+
+    let start = app
+        .backend_picker_selected_index()
+        .saturating_sub((shown_count as usize).saturating_sub(1));
+    let shown = entries
+        .iter()
+        .skip(start)
+        .take(shown_count as usize)
+        .collect::<Vec<_>>();
+
+    let mut lines = Vec::with_capacity(shown.len() + 1);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Select Backend",
+            Style::default()
+                .fg(theme.active_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "(Up/Down select, Enter/Space choose)",
+            Style::default().fg(theme.muted_fg),
+        ),
+    ]));
+    for (idx, item) in shown.iter().enumerate() {
+        let absolute_idx = start + idx;
+        let selected = absolute_idx == app.backend_picker_selected_index();
+        let style = if selected {
+            Style::default()
+                .fg(theme.active_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_fg)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { ">" } else { " " }.to_string(),
+                Style::default().fg(theme.muted_fg),
+            ),
+            Span::raw(" "),
+            Span::styled(item.label.to_string(), style),
+            Span::raw(" "),
+            Span::styled(
+                format!("({})", item.description),
                 Style::default().fg(theme.muted_fg),
             ),
         ]));
@@ -1061,10 +1161,7 @@ fn convert_markdown_line(line: CoreLine<'_>) -> Line<'static> {
 }
 
 fn convert_markdown_span(span: CoreSpan<'_>) -> Span<'static> {
-    Span::styled(
-        span.content.to_string(),
-        convert_markdown_style(span.style),
-    )
+    Span::styled(span.content.to_string(), convert_markdown_style(span.style))
 }
 
 fn convert_markdown_style(style: CoreStyle) -> Style {

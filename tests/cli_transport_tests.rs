@@ -80,9 +80,13 @@ fn workflow_validate_tasks_human_output_is_compact_by_default() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tasks_file = std::env::temp_dir().join(format!("metaagent-cli-workflow-validate-{now}.json"));
-    std::fs::write(&tasks_file, r#"[{"id":"1","title":"Task 1","details":"details","parent_id":null,"order":0}]"#)
-        .expect("write test tasks");
+    let tasks_file =
+        std::env::temp_dir().join(format!("metaagent-cli-workflow-validate-{now}.json"));
+    std::fs::write(
+        &tasks_file,
+        r#"[{"id":"1","title":"Task 1","details":"details","parent_id":null,"order":0}]"#,
+    )
+    .expect("write test tasks");
 
     let tasks_file_arg = tasks_file.to_string_lossy().to_string();
     let output = run_cli(&[
@@ -112,9 +116,14 @@ fn workflow_validate_tasks_human_output_verbose_outputs_full_payload() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tasks_file = std::env::temp_dir().join(format!("metaagent-cli-workflow-validate-verbose-{now}.json"));
-    std::fs::write(&tasks_file, r#"[{"id":"1","title":"Task 1","details":"details","parent_id":null,"order":0}]"#)
-        .expect("write test tasks");
+    let tasks_file = std::env::temp_dir().join(format!(
+        "metaagent-cli-workflow-validate-verbose-{now}.json"
+    ));
+    std::fs::write(
+        &tasks_file,
+        r#"[{"id":"1","title":"Task 1","details":"details","parent_id":null,"order":0}]"#,
+    )
+    .expect("write test tasks");
 
     let tasks_file_arg = tasks_file.to_string_lossy().to_string();
     let output = run_cli(&[

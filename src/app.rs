@@ -2,13 +2,15 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::agent::BackendKind;
 use crate::session_store::PlannerTaskFileEntry;
 use crate::subagents;
 use crate::text_layout::{WrappedText, wrap_word_with_positions};
 use crate::workflow::{RightPaneBlockView, StartedJob, WorkerRole, Workflow, WorkflowFailure};
 
-const COMMAND_INDEX: [(&str, &str); 15] = [
+const COMMAND_INDEX: [(&str, &str); 16] = [
     ("/start", "Start execution"),
+    ("/backend", "Choose backend"),
     ("/planner", "Show collaborative planner markdown"),
     ("/convert", "Convert planner markdown to tasks"),
     ("/skip-plan", "Show task list view"),
@@ -62,6 +64,19 @@ struct ResumePickerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendOption {
+    pub kind: BackendKind,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct BackendPickerState {
+    entries: Vec<BackendOption>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     LeftTop,
     LeftBottom,
@@ -100,6 +115,7 @@ pub struct App {
     last_reported_context: Vec<String>,
     expanded_detail_keys: HashSet<String>,
     resume_picker: Option<ResumePickerState>,
+    backend_picker: Option<BackendPickerState>,
     task_check_in_progress: bool,
     docs_attach_in_progress: bool,
     master_in_progress: bool,
@@ -143,6 +159,7 @@ impl Default for App {
             last_reported_context: Vec::new(),
             expanded_detail_keys: HashSet::new(),
             resume_picker: None,
+            backend_picker: None,
             task_check_in_progress: false,
             docs_attach_in_progress: false,
             master_in_progress: false,
@@ -652,11 +669,11 @@ impl App {
     }
 
     pub fn should_show_command_index(&self) -> bool {
-        self.resume_picker.is_none() && !self.command_suggestions().is_empty()
+        !self.is_any_picker_open() && !self.command_suggestions().is_empty()
     }
 
     pub fn autocomplete_top_command(&mut self) -> bool {
-        if self.resume_picker.is_some() {
+        if self.is_any_picker_open() {
             return false;
         }
         let Some(top) = self.command_suggestions().first().copied() else {
@@ -670,6 +687,7 @@ impl App {
     }
 
     pub fn open_resume_picker(&mut self, entries: Vec<ResumeSessionOption>) {
+        self.backend_picker = None;
         if entries.is_empty() {
             self.resume_picker = None;
         } else {
@@ -682,6 +700,57 @@ impl App {
 
     pub fn is_resume_picker_open(&self) -> bool {
         self.resume_picker.is_some()
+    }
+
+    pub fn open_backend_picker(&mut self, entries: Vec<BackendOption>) {
+        self.resume_picker = None;
+        if entries.is_empty() {
+            self.backend_picker = None;
+        } else {
+            self.backend_picker = Some(BackendPickerState {
+                entries,
+                selected: 0,
+            });
+        }
+    }
+
+    pub fn is_backend_picker_open(&self) -> bool {
+        self.backend_picker.is_some()
+    }
+
+    pub fn backend_picker_options(&self) -> &[BackendOption] {
+        match self.backend_picker.as_ref() {
+            Some(state) => &state.entries,
+            None => &[],
+        }
+    }
+
+    pub fn backend_picker_selected_index(&self) -> usize {
+        self.backend_picker
+            .as_ref()
+            .map(|state| state.selected)
+            .unwrap_or(0)
+    }
+
+    pub fn backend_picker_move_up(&mut self) {
+        let Some(state) = self.backend_picker.as_mut() else {
+            return;
+        };
+        state.selected = state.selected.saturating_sub(1);
+    }
+
+    pub fn backend_picker_move_down(&mut self) {
+        let Some(state) = self.backend_picker.as_mut() else {
+            return;
+        };
+        if state.selected + 1 < state.entries.len() {
+            state.selected += 1;
+        }
+    }
+
+    pub fn select_backend_option(&mut self) -> Option<BackendOption> {
+        let state = self.backend_picker.take()?;
+        state.entries.get(state.selected).copied()
     }
 
     pub fn set_task_check_in_progress(&mut self, in_progress: bool) {
@@ -750,6 +819,10 @@ impl App {
         state.entries.get(state.selected).cloned()
     }
 
+    fn is_any_picker_open(&self) -> bool {
+        self.resume_picker.is_some() || self.backend_picker.is_some()
+    }
+
     pub fn replace_rolling_context_entries(&mut self, entries: Vec<String>) {
         self.workflow
             .replace_rolling_context_entries(entries.clone());
@@ -811,7 +884,10 @@ impl App {
         if self.planner_cursor == 0 {
             return;
         }
-        let start = char_to_byte_idx(&self.planner_markdown, self.planner_cursor.saturating_sub(1));
+        let start = char_to_byte_idx(
+            &self.planner_markdown,
+            self.planner_cursor.saturating_sub(1),
+        );
         let end = char_to_byte_idx(&self.planner_markdown, self.planner_cursor);
         self.planner_markdown.drain(start..end);
         self.planner_cursor = self.planner_cursor.saturating_sub(1);

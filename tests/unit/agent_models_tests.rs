@@ -1,13 +1,7 @@
 use super::*;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-fn home_env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 fn unique_temp_home(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -101,8 +95,32 @@ fn unknown_profile_assignment_falls_back_to_large_smart() {
 }
 
 #[test]
+fn backend_override_precedence_and_fallback_use_embedded_defaults() {
+    let routing = CodexAgentModelRouting::from_toml_str(
+        r#"
+        [backend]
+        selected = "claude"
+
+        [backend.claude]
+        program = " /usr/local/bin/claude-code "
+        "#,
+    )
+    .expect("parse should succeed");
+
+    let command = routing.base_command_config();
+    assert_eq!(command.backend_kind(), crate::agent::BackendKind::Claude);
+    assert_eq!(command.program, "/usr/local/bin/claude-code");
+    assert_eq!(
+        command.args_prefix,
+        vec!["--dangerously-skip-permissions".to_string()]
+    );
+}
+
+#[test]
 fn load_from_metaagent_config_creates_default_config_when_missing() {
-    let _guard = home_env_lock().lock().expect("lock HOME mutex");
+    let _guard = crate::artifact_io::home_env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let old_home = std::env::var_os("HOME");
     let temp_home = unique_temp_home("metaagent-home-default-config");
     fs::create_dir_all(&temp_home).expect("create temp HOME");
@@ -127,8 +145,59 @@ fn load_from_metaagent_config_creates_default_config_when_missing() {
 }
 
 #[test]
+fn load_from_metaagent_config_merges_and_persists_user_overrides() {
+    let _guard = crate::artifact_io::home_env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let old_home = std::env::var_os("HOME");
+    let temp_home = unique_temp_home("metaagent-home-merge-config");
+    let config_dir = temp_home.join(".metaagent");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+        [backend]
+        selected = "claude"
+
+        [backend.claude]
+        program = "claude-custom"
+
+        [custom]
+        keep = true
+        "#,
+    )
+    .expect("write override config");
+    unsafe { std::env::set_var("HOME", &temp_home) };
+
+    let routing = CodexAgentModelRouting::load_from_metaagent_config()
+        .expect("loading merged config should succeed");
+    let command = routing.base_command_config();
+    assert_eq!(command.backend_kind(), crate::agent::BackendKind::Claude);
+    assert_eq!(command.program, "claude-custom");
+    assert_eq!(
+        command.args_prefix,
+        vec!["--dangerously-skip-permissions".to_string()]
+    );
+
+    let merged_text =
+        fs::read_to_string(config_dir.join("config.toml")).expect("merged config should persist");
+    assert!(merged_text.contains("[storage]"));
+    assert!(merged_text.contains("[codex.agent_profiles]"));
+    assert!(merged_text.contains("[custom]"));
+    assert!(merged_text.contains("keep = true"));
+
+    match old_home {
+        Some(value) => unsafe { std::env::set_var("HOME", value) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+    let _ = fs::remove_dir_all(&temp_home);
+}
+
+#[test]
 fn load_from_metaagent_config_reports_invalid_data_for_malformed_file() {
-    let _guard = home_env_lock().lock().expect("lock HOME mutex");
+    let _guard = crate::artifact_io::home_env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let old_home = std::env::var_os("HOME");
     let temp_home = unique_temp_home("metaagent-home-bad-config");
     let config_dir = temp_home.join(".metaagent");
@@ -138,11 +207,16 @@ fn load_from_metaagent_config_reports_invalid_data_for_malformed_file() {
         "[codex.model_profiles.bad\n",
     )
     .expect("write malformed config");
+    let original_text =
+        fs::read_to_string(config_dir.join("config.toml")).expect("read malformed config");
     unsafe { std::env::set_var("HOME", &temp_home) };
 
     let err = CodexAgentModelRouting::load_from_metaagent_config()
         .expect_err("malformed config should fail");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let after_text = fs::read_to_string(config_dir.join("config.toml"))
+        .expect("malformed config should remain on disk");
+    assert_eq!(after_text, original_text);
 
     match old_home {
         Some(value) => unsafe { std::env::set_var("HOME", value) },

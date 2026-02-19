@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::BackendKind;
 use crate::session_store::{PlannerTaskKindFile, PlannerTaskStatusFile};
 use crate::text_layout::wrap_word_with_positions;
 use std::sync::Arc;
@@ -658,6 +659,17 @@ fn command_index_matches_resume_prefix() {
 }
 
 #[test]
+fn command_index_matches_backend_prefix() {
+    let mut app = App::default();
+    app.input_char('/');
+    app.input_char('b');
+    let suggestions = app.command_suggestions();
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(suggestions[0].command, "/backend");
+    assert_eq!(suggestions[0].description, "Choose backend");
+}
+
+#[test]
 fn command_index_matches_split_and_merge_prefixes() {
     let mut app = App::default();
     app.input_char('/');
@@ -755,6 +767,19 @@ fn command_index_tab_autocompletes_top_match() {
 }
 
 #[test]
+fn command_index_tab_autocompletes_backend_command() {
+    let mut app = App::default();
+    app.input_char('/');
+    app.input_char('b');
+    assert!(app.autocomplete_top_command());
+    assert_eq!(app.chat_input(), "/backend");
+    assert_eq!(
+        app.chat_cursor_line_col(200),
+        (0, "/backend".chars().count() as u16)
+    );
+}
+
+#[test]
 fn resume_picker_navigation_and_selection_work() {
     let mut app = App::default();
     app.open_resume_picker(vec![
@@ -787,6 +812,38 @@ fn resume_picker_navigation_and_selection_work() {
 }
 
 #[test]
+fn backend_picker_navigation_and_selection_work() {
+    let mut app = App::default();
+    app.open_backend_picker(vec![
+        BackendOption {
+            kind: BackendKind::Codex,
+            label: "Codex",
+            description: "Codex backend",
+        },
+        BackendOption {
+            kind: BackendKind::Claude,
+            label: "Claude",
+            description: "Claude backend",
+        },
+    ]);
+
+    assert!(app.is_backend_picker_open());
+    assert_eq!(app.backend_picker_options().len(), 2);
+    assert_eq!(app.backend_picker_selected_index(), 0);
+
+    app.backend_picker_move_down();
+    assert_eq!(app.backend_picker_selected_index(), 1);
+    app.backend_picker_move_down();
+    assert_eq!(app.backend_picker_selected_index(), 1);
+    app.backend_picker_move_up();
+    assert_eq!(app.backend_picker_selected_index(), 0);
+
+    let selected = app.select_backend_option().expect("selection should exist");
+    assert_eq!(selected.kind, BackendKind::Codex);
+    assert!(!app.is_backend_picker_open());
+}
+
+#[test]
 fn command_index_hides_while_resume_picker_open() {
     let mut app = App::default();
     app.input_char('/');
@@ -799,4 +856,50 @@ fn command_index_hides_while_resume_picker_open() {
         last_used_epoch_secs: 1,
     }]);
     assert!(!app.should_show_command_index());
+}
+
+#[test]
+fn command_index_hides_while_backend_picker_open() {
+    let mut app = App::default();
+    app.input_char('/');
+    assert!(app.should_show_command_index());
+    app.open_backend_picker(vec![BackendOption {
+        kind: BackendKind::Codex,
+        label: "Codex",
+        description: "Codex backend",
+    }]);
+    assert!(!app.should_show_command_index());
+    assert!(!app.autocomplete_top_command());
+}
+
+#[test]
+fn backend_and_resume_pickers_remain_mutually_exclusive() {
+    let mut app = App::default();
+    app.open_resume_picker(vec![ResumeSessionOption {
+        session_dir: "/tmp/s1".to_string(),
+        workspace: "/tmp/w1".to_string(),
+        title: None,
+        created_at_label: None,
+        last_used_epoch_secs: 1,
+    }]);
+    assert!(app.is_resume_picker_open());
+    assert!(!app.is_backend_picker_open());
+
+    app.open_backend_picker(vec![BackendOption {
+        kind: BackendKind::Codex,
+        label: "Codex",
+        description: "Codex backend",
+    }]);
+    assert!(app.is_backend_picker_open());
+    assert!(!app.is_resume_picker_open());
+
+    app.open_resume_picker(vec![ResumeSessionOption {
+        session_dir: "/tmp/s2".to_string(),
+        workspace: "/tmp/w2".to_string(),
+        title: None,
+        created_at_label: None,
+        last_used_epoch_secs: 2,
+    }]);
+    assert!(app.is_resume_picker_open());
+    assert!(!app.is_backend_picker_open());
 }

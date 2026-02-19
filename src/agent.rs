@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -22,28 +23,69 @@ pub struct CodexCommandConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Codex,
+    Claude,
+}
+
+impl BackendKind {
+    fn from_program(program: &str) -> Self {
+        let binary = Path::new(program)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        if binary.contains("claude") {
+            Self::Claude
+        } else {
+            Self::Codex
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterOutputMode {
     PlainText,
     JsonAssistantOnly,
 }
 
+impl CodexCommandConfig {
+    pub fn default_for_backend(backend: BackendKind) -> Self {
+        match backend {
+            BackendKind::Codex => Self {
+                program: "codex".to_string(),
+                // This version intentionally runs Codex fully unsandboxed and with approvals disabled.
+                // Future versions should replace this with a safer, explicit permissions model.
+                args_prefix: vec![
+                    "exec".to_string(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "--color".to_string(),
+                    "never".to_string(),
+                ],
+                output_mode: AdapterOutputMode::PlainText,
+                persistent_session: false,
+                model: None,
+                model_reasoning_effort: None,
+            },
+            BackendKind::Claude => Self {
+                program: "claude".to_string(),
+                args_prefix: vec!["--dangerously-skip-permissions".to_string()],
+                output_mode: AdapterOutputMode::PlainText,
+                persistent_session: false,
+                model: None,
+                model_reasoning_effort: None,
+            },
+        }
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        BackendKind::from_program(&self.program)
+    }
+}
+
 impl Default for CodexCommandConfig {
     fn default() -> Self {
-        Self {
-            program: "codex".to_string(),
-            // This version intentionally runs Codex fully unsandboxed and with approvals disabled.
-            // Future versions should replace this with a safer, explicit permissions model.
-            args_prefix: vec![
-                "exec".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--color".to_string(),
-                "never".to_string(),
-            ],
-            output_mode: AdapterOutputMode::PlainText,
-            persistent_session: false,
-            model: None,
-            model_reasoning_effort: None,
-        }
+        Self::default_for_backend(BackendKind::Codex)
     }
 }
 
@@ -104,12 +146,8 @@ impl CodexAdapter {
             if config.persistent_session {
                 let known_session = session_id.lock().ok().and_then(|g| g.clone());
                 if let Some(existing_session) = known_session {
-                    let resume_args = build_resume_args(&config);
                     command
-                        .arg("exec")
-                        .arg("resume")
-                        .args(resume_args)
-                        .arg(existing_session)
+                        .args(build_resume_prompt_args(&config, &existing_session))
                         .arg(prompt);
                 } else {
                     command.args(build_new_session_args(&config)).arg(prompt);
@@ -261,30 +299,75 @@ fn sanitize_resume_args(args: Vec<String>) -> Vec<String> {
 }
 
 fn build_new_session_args(config: &CodexCommandConfig) -> Vec<String> {
-    let mut args = config.args_prefix.clone();
-    append_model_selection_args(
-        &mut args,
-        config.model.as_deref(),
-        config.model_reasoning_effort.as_deref(),
-    );
-    args
+    match config.backend_kind() {
+        BackendKind::Codex => {
+            let mut args = config.args_prefix.clone();
+            append_codex_model_selection_args(
+                &mut args,
+                config.model.as_deref(),
+                config.model_reasoning_effort.as_deref(),
+            );
+            args
+        }
+        BackendKind::Claude => {
+            let mut args = config.args_prefix.clone();
+            if matches!(config.output_mode, AdapterOutputMode::JsonAssistantOnly) {
+                args.push("--output-format".to_string());
+                args.push("stream-json".to_string());
+            }
+            append_claude_model_selection_args(&mut args, config.model.as_deref());
+            args.push("-p".to_string());
+            args
+        }
+    }
 }
 
 fn build_resume_args(config: &CodexCommandConfig) -> Vec<String> {
-    let mut args = config.args_prefix.clone();
-    if args.first().is_some_and(|arg| arg == "exec") {
-        args.remove(0);
+    match config.backend_kind() {
+        BackendKind::Codex => {
+            let mut args = config.args_prefix.clone();
+            if args.first().is_some_and(|arg| arg == "exec") {
+                args.remove(0);
+            }
+            let mut args = sanitize_resume_args(args);
+            append_codex_model_selection_args(
+                &mut args,
+                config.model.as_deref(),
+                config.model_reasoning_effort.as_deref(),
+            );
+            args
+        }
+        BackendKind::Claude => {
+            let mut args = config.args_prefix.clone();
+            if matches!(config.output_mode, AdapterOutputMode::JsonAssistantOnly) {
+                args.push("--output-format".to_string());
+                args.push("stream-json".to_string());
+            }
+            append_claude_model_selection_args(&mut args, config.model.as_deref());
+            args
+        }
     }
-    let mut args = sanitize_resume_args(args);
-    append_model_selection_args(
-        &mut args,
-        config.model.as_deref(),
-        config.model_reasoning_effort.as_deref(),
-    );
-    args
 }
 
-fn append_model_selection_args(
+fn build_resume_prompt_args(config: &CodexCommandConfig, existing_session: &str) -> Vec<String> {
+    match config.backend_kind() {
+        BackendKind::Codex => {
+            let mut args = vec!["exec".to_string(), "resume".to_string()];
+            args.extend(build_resume_args(config));
+            args.push(existing_session.to_string());
+            args
+        }
+        BackendKind::Claude => {
+            let mut args = build_resume_args(config);
+            args.push("--resume".to_string());
+            args.push(existing_session.to_string());
+            args.push("-p".to_string());
+            args
+        }
+    }
+}
+
+fn append_codex_model_selection_args(
     args: &mut Vec<String>,
     model: Option<&str>,
     model_reasoning_effort: Option<&str>,
@@ -299,6 +382,13 @@ fn append_model_selection_args(
     {
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort={effort:?}"));
+    }
+}
+
+fn append_claude_model_selection_args(args: &mut Vec<String>, model: Option<&str>) {
+    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
     }
 }
 
