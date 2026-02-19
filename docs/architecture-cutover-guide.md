@@ -18,6 +18,9 @@ Primary architecture reference:
 - `src/services.rs`
   - Owns orchestration and prompt-preparation service seams used by runtime (`CoreOrchestrationService`, `UiPromptService`).
   - `main.rs` should call these services instead of duplicating orchestration helpers.
+- `src/agent.rs` and `src/agent_models.rs`
+  - Own backend process command defaults and routing/config merge behavior.
+  - Keep backend-selection resolution and per-agent command composition here, not in UI state types.
 - `src/api/`
   - Owns transport-facing contracts (`contracts.rs`), envelopes (`envelope.rs`), and capability matrix (`capabilities.rs`).
 - `src/main.rs`
@@ -62,3 +65,9 @@ Before merging architecture-affecting changes:
 - Confirm failure modes remain explicit and serialized through API envelopes.
 - Confirm transport adapters stay thin and contract-driven.
 - Confirm operator-facing docs stay aligned (`docs/cli-parity-checklist.md`, this guide).
+
+## Session Guardrails
+
+- Runtime backend selection uses `~/.metaagent/config.toml` (`[backend].selected`), including `/backend` picker updates.
+- Session artifacts under `src/session_store.rs` remain scoped to per-session state only (`tasks.json`, planner/context/failure metadata).
+- Backend changes apply to newly created adapters in the current run; in-flight adapters are not swapped mid-request.

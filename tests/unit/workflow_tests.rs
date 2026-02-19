@@ -1292,12 +1292,16 @@ fn audit_retry_limit_stops_after_four_failed_audits() {
             .any(|m| m.contains(&format!("Max retries ({MAX_AUDIT_RETRIES}) reached")))
     );
 
-    let writer = wf.start_next_job().expect("test writer after audit exhaustion");
+    let writer = wf
+        .start_next_job()
+        .expect("test writer after audit exhaustion");
     assert_eq!(writer.role, WorkerRole::TestWriter);
     wf.append_active_output("wrote tests after exhausted audit".to_string());
     wf.finish_active_job(true, 0);
 
-    let runner = wf.start_next_job().expect("test runner after audit exhaustion");
+    let runner = wf
+        .start_next_job()
+        .expect("test runner after audit exhaustion");
     assert_eq!(runner.role, WorkerRole::TestRunner);
     wf.append_active_output("all passed".to_string());
     wf.finish_active_job(true, 0);
@@ -2713,9 +2717,13 @@ fn resume_does_not_mark_task_done_with_pending_implementor_auditor() {
     assert_ne!(top_status, Some(PlannerTaskStatusFile::Done));
 
     let mut resumed = Workflow::default();
-    resumed.sync_planner_tasks_from_file(snapshot).expect("reload should succeed");
+    resumed
+        .sync_planner_tasks_from_file(snapshot)
+        .expect("reload should succeed");
     resumed.start_execution();
-    let next = resumed.start_next_job().expect("next job should resume pending work on top A");
+    let next = resumed
+        .start_next_job()
+        .expect("next job should resume pending work on top A");
     assert_eq!(next.role, WorkerRole::Auditor);
     match next.run {
         JobRun::AgentPrompt(prompt) => {

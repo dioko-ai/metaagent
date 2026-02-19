@@ -15,6 +15,36 @@ fn embedded_default_config_includes_storage_section() {
 }
 
 #[test]
+fn embedded_default_config_includes_backend_defaults() {
+    let parsed: toml::Value = toml::from_str(crate::default_config::DEFAULT_CONFIG_TOML)
+        .expect("embedded default config should parse as toml");
+    let selected = parsed
+        .get("backend")
+        .and_then(|backend| backend.get("selected"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(selected, Some("codex"));
+
+    let codex_program = parsed
+        .get("backend")
+        .and_then(|backend| backend.get("codex"))
+        .and_then(|codex| codex.get("program"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(codex_program, Some("codex"));
+}
+
+#[test]
+fn metaagent_config_storage_falls_back_when_storage_section_missing() {
+    let parsed: MetaAgentConfig = toml::from_str(
+        r#"
+        [backend]
+        selected = "claude"
+        "#,
+    )
+    .expect("partial config should parse");
+    assert_eq!(parsed.storage.root_dir, "~/.metaagent/sessions");
+}
+
+#[test]
 fn planner_task_status_defaults_to_pending() {
     let parsed: PlannerTaskFileEntry =
         serde_json::from_str("{\"id\":\"a\",\"title\":\"Task A\",\"parent_id\":null,\"order\":0}")
@@ -158,6 +188,32 @@ fn open_existing_supports_rolling_context_round_trip() {
         .expect("write context");
     let read_back = store.read_rolling_context().expect("read context");
     assert_eq!(read_back, vec!["one".to_string(), "two".to_string()]);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn write_rolling_context_reports_persistence_error_when_path_is_directory() {
+    let base = std::env::temp_dir().join(format!(
+        "metaagent-session-context-write-fail-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos()
+    ));
+    let session_dir = base.join("session-a");
+    fs::create_dir_all(&session_dir).expect("session dir");
+    let cwd = std::env::current_dir().expect("cwd");
+    let store = SessionStore::open_existing(&cwd, &session_dir).expect("open existing");
+
+    fs::remove_file(session_dir.join("rolling_context.json")).expect("remove default context file");
+    fs::create_dir_all(session_dir.join("rolling_context.json"))
+        .expect("replace context file path with directory");
+
+    let err = store
+        .write_rolling_context(&["one".to_string()])
+        .expect_err("writing rolling context should fail when path is a directory");
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
 
     let _ = fs::remove_dir_all(&base);
 }

@@ -11,6 +11,42 @@ fn open_temp_store(prefix: &str) -> (SessionStore, std::path::PathBuf) {
     (store, session_dir)
 }
 
+fn with_temp_home<T>(prefix: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
+    let _guard = crate::artifact_io::home_env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_home = std::env::temp_dir().join(format!("{prefix}-{now}"));
+    std::fs::create_dir_all(&temp_home).expect("create temp home");
+
+    let prior_home = std::env::var_os("HOME");
+    // SAFETY: tests serialize HOME mutation with HOME_LOCK and restore afterward.
+    unsafe {
+        std::env::set_var("HOME", &temp_home);
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&temp_home)));
+
+    // SAFETY: restoration mirrors the guarded mutation above.
+    unsafe {
+        if let Some(value) = prior_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+    std::fs::remove_dir_all(&temp_home).ok();
+
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn integration_plan_with_final() -> Vec<PlannerTaskFileEntry> {
     vec![
         PlannerTaskFileEntry {
@@ -136,7 +172,8 @@ fn parse_launch_options_accepts_send_file() {
 
 #[test]
 fn parse_launch_options_accepts_verbose_flag() {
-    let options = parse_launch_options(vec!["--verbose".to_string()]).expect("options should parse");
+    let options =
+        parse_launch_options(vec!["--verbose".to_string()]).expect("options should parse");
     assert!(options.command.is_none());
     assert!(options.verbose);
 }
@@ -150,6 +187,7 @@ fn parse_launch_options_rejects_unknown_arg() {
 #[test]
 fn slash_commands_do_not_route_to_master() {
     assert!(!should_send_to_master("/start"));
+    assert!(!should_send_to_master("/backend"));
     assert!(!should_send_to_master("/convert"));
     assert!(!should_send_to_master("/skip-plan"));
     assert!(!should_send_to_master("/definitely-not-a-command"));
@@ -194,6 +232,7 @@ fn active_session_gate_applies_only_to_session_bound_slash_commands() {
 #[test]
 fn known_slash_command_detection_is_strict() {
     assert!(is_known_slash_command("/start"));
+    assert!(is_known_slash_command("/backend"));
     assert!(is_known_slash_command("/convert"));
     assert!(is_known_slash_command("/skip-plan"));
     assert!(is_known_slash_command("/run"));
@@ -262,6 +301,82 @@ fn submit_block_reason_prioritizes_project_info_and_respects_task_check_quit_esc
 }
 
 #[test]
+fn backend_command_is_not_blocked_while_other_flows_are_in_flight() {
+    assert_eq!(
+        submit_block_reason(true, true, true, true, "/backend"),
+        None
+    );
+}
+
+#[test]
+fn backend_command_recognition_is_trimmed_and_case_insensitive() {
+    assert!(is_backend_command("/backend"));
+    assert!(is_backend_command("  /BACKEND  "));
+    assert!(!is_backend_command("/backend now"));
+}
+
+#[test]
+fn backend_picker_options_prioritize_current_backend() {
+    let codex_first = backend_picker_options(BackendKind::Codex);
+    assert_eq!(codex_first.len(), 2);
+    assert_eq!(codex_first[0].kind, BackendKind::Codex);
+    assert_eq!(codex_first[1].kind, BackendKind::Claude);
+
+    let claude_first = backend_picker_options(BackendKind::Claude);
+    assert_eq!(claude_first.len(), 2);
+    assert_eq!(claude_first[0].kind, BackendKind::Claude);
+    assert_eq!(claude_first[1].kind, BackendKind::Codex);
+}
+
+#[test]
+fn update_backend_selected_in_toml_preserves_existing_sections() {
+    let updated = update_backend_selected_in_toml(
+        r#"
+        [backend]
+        selected = "codex"
+
+        [backend.codex]
+        program = "codex-custom"
+
+        [custom]
+        keep = true
+        "#,
+        BackendKind::Claude,
+    )
+    .expect("backend update should succeed");
+
+    let parsed: toml::Value = toml::from_str(&updated).expect("updated config should parse");
+    let selected = parsed
+        .get("backend")
+        .and_then(|backend| backend.get("selected"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(selected, Some("claude"));
+
+    let codex_program = parsed
+        .get("backend")
+        .and_then(|backend| backend.get("codex"))
+        .and_then(|codex| codex.get("program"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(codex_program, Some("codex-custom"));
+
+    let keep_custom = parsed
+        .get("custom")
+        .and_then(|custom| custom.get("keep"))
+        .and_then(toml::Value::as_bool);
+    assert_eq!(keep_custom, Some(true));
+}
+
+#[test]
+fn update_backend_selected_in_toml_rejects_non_table_backend_section() {
+    let err = update_backend_selected_in_toml("backend = 1", BackendKind::Claude)
+        .expect_err("non-table backend section should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err
+        .to_string()
+        .contains("backend section is not a TOML table"));
+}
+
+#[test]
 fn execution_busy_blocks_master_and_task_editing_commands() {
     assert_eq!(
         submit_block_reason(false, false, false, true, "Please update tasks"),
@@ -303,6 +418,7 @@ fn post_completion_tail_drain_collects_late_worker_output() {
         ],
         output_mode: AdapterOutputMode::PlainText,
         persistent_session: true,
+        skip_reader_join_after_wait: false,
         model: None,
         model_reasoning_effort: None,
     });
@@ -1997,6 +2113,244 @@ fn docs_attach_blocks_session_switch_commands() {
             .contains("Documentation attach is still running")
     );
     assert!(!app.is_resume_picker_open());
+}
+
+#[test]
+fn backend_command_opens_picker_and_closes_resume_picker() {
+    let mut app = App::default();
+    app.open_resume_picker(vec![ResumeSessionOption {
+        session_dir: "/tmp/example".to_string(),
+        workspace: "workspace".to_string(),
+        title: Some("Session".to_string()),
+        created_at_label: Some("now".to_string()),
+        last_used_epoch_secs: 1,
+    }]);
+    assert!(app.is_resume_picker_open());
+
+    let master_adapter = CodexAdapter::new();
+    let master_report_adapter = CodexAdapter::new();
+    let project_info_adapter = CodexAdapter::new();
+    let docs_attach_adapter = CodexAdapter::new();
+    let test_runner_adapter = TestRunnerAdapter::new();
+    let model_routing = CodexAgentModelRouting::default();
+
+    let mut worker_agent_adapters: HashMap<String, CodexAdapter> = HashMap::new();
+    let mut active_worker_context_key = None;
+    let mut session_store: Option<SessionStore> = None;
+    let cwd = std::env::current_dir().expect("cwd");
+    let mut pending_task_write_baseline = None;
+    let mut docs_attach_in_flight = false;
+    let mut master_session_intro_needed = true;
+    let mut master_report_session_intro_needed = true;
+    let mut pending_master_message_after_project_info = None;
+    let mut project_info_in_flight = false;
+    let mut project_info_stage = None;
+    let mut project_info_text = None;
+    let mut master_report_in_flight = false;
+    let mut pending_master_report_prompts = std::collections::VecDeque::new();
+    let mut master_report_transcript = Vec::new();
+    let mut task_check_in_flight = false;
+    let mut task_check_baseline = None;
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+
+    submit_user_message(
+        &mut app,
+        "/backend".to_string(),
+        &master_adapter,
+        &master_report_adapter,
+        &project_info_adapter,
+        &mut worker_agent_adapters,
+        &mut active_worker_context_key,
+        &docs_attach_adapter,
+        &test_runner_adapter,
+        &mut master_report_in_flight,
+        &mut pending_master_report_prompts,
+        &mut master_report_transcript,
+        &mut task_check_in_flight,
+        &mut task_check_baseline,
+        &mut session_store,
+        &cwd,
+        &mut terminal,
+        &mut pending_task_write_baseline,
+        &mut docs_attach_in_flight,
+        &mut master_session_intro_needed,
+        &mut master_report_session_intro_needed,
+        &mut pending_master_message_after_project_info,
+        &mut project_info_in_flight,
+        &mut project_info_stage,
+        &mut project_info_text,
+        &model_routing,
+    )
+    .expect("backend command should not hard fail");
+
+    assert!(!app.is_resume_picker_open());
+    assert!(app.is_backend_picker_open());
+    assert_eq!(app.backend_picker_options().len(), 2);
+    assert!(
+        app.left_bottom_lines()
+            .last()
+            .expect("status message")
+            .contains("Select a backend in the picker")
+    );
+}
+
+#[test]
+fn apply_backend_selection_persists_and_reports_success() {
+    with_temp_home("metaagent-backend-select-success", |_| {
+        let mut app = App::default();
+        let mut selected_backend = BackendKind::Codex;
+        let mut model_routing = CodexAgentModelRouting::default();
+        let mut master_adapter = build_json_persistent_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::Master,
+        );
+        let mut master_report_adapter = build_json_persistent_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::MasterReport,
+        );
+        let mut project_info_adapter = build_json_persistent_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::ProjectInfo,
+        );
+        let mut docs_attach_adapter = build_plain_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::DocsAttach,
+            false,
+        );
+        let mut task_check_adapter = build_plain_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::TaskCheck,
+            false,
+        );
+        let mut active_worker_context_key = Some("top:42".to_string());
+        let mut worker_agent_adapters: HashMap<String, CodexAdapter> =
+            [("top:42".to_string(), CodexAdapter::new())]
+                .into_iter()
+                .collect();
+
+        apply_backend_selection(
+            &mut app,
+            BackendOption {
+                kind: BackendKind::Claude,
+                label: "Claude",
+                description: "Anthropic Claude backend",
+            },
+            &mut selected_backend,
+            &mut model_routing,
+            &mut active_worker_context_key,
+            &mut worker_agent_adapters,
+            &mut master_adapter,
+            &mut master_report_adapter,
+            &mut project_info_adapter,
+            &mut docs_attach_adapter,
+            &mut task_check_adapter,
+        );
+
+        assert_eq!(selected_backend, BackendKind::Claude);
+        assert_eq!(
+            model_routing.base_command_config().backend_kind(),
+            BackendKind::Claude
+        );
+        let expected_program = model_routing.base_command_config().program;
+        assert_eq!(master_adapter.program(), expected_program);
+        assert_eq!(master_report_adapter.program(), expected_program);
+        assert_eq!(project_info_adapter.program(), expected_program);
+        assert_eq!(docs_attach_adapter.program(), expected_program);
+        assert_eq!(task_check_adapter.program(), expected_program);
+        assert!(active_worker_context_key.is_none());
+        assert!(worker_agent_adapters.is_empty());
+        let last = app.left_bottom_lines().last().expect("status message");
+        assert!(last.contains("Backend set to Claude. Saved to"));
+        assert!(last.contains("New adapters will use this backend."));
+    });
+}
+
+#[test]
+fn apply_backend_selection_persist_failure_keeps_in_memory_backend_and_reports_failure() {
+    with_temp_home("metaagent-backend-select-failure", |home| {
+        let config_dir = home.join(".metaagent");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::create_dir(config_dir.join("config.toml")).expect("create invalid config path");
+
+        let mut app = App::default();
+        let mut selected_backend = BackendKind::Codex;
+        let mut model_routing = CodexAgentModelRouting::default();
+        let mut master_adapter = build_json_persistent_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::Master,
+        );
+        let mut master_report_adapter = build_json_persistent_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::MasterReport,
+        );
+        let mut project_info_adapter = build_json_persistent_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::ProjectInfo,
+        );
+        let mut docs_attach_adapter = build_plain_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::DocsAttach,
+            false,
+        );
+        let mut task_check_adapter = build_plain_adapter(
+            &model_routing,
+            selected_backend,
+            CodexAgentKind::TaskCheck,
+            false,
+        );
+        let mut active_worker_context_key = Some("top:42".to_string());
+        let mut worker_agent_adapters: HashMap<String, CodexAdapter> =
+            [("top:42".to_string(), CodexAdapter::new())]
+                .into_iter()
+                .collect();
+
+        apply_backend_selection(
+            &mut app,
+            BackendOption {
+                kind: BackendKind::Claude,
+                label: "Claude",
+                description: "Anthropic Claude backend",
+            },
+            &mut selected_backend,
+            &mut model_routing,
+            &mut active_worker_context_key,
+            &mut worker_agent_adapters,
+            &mut master_adapter,
+            &mut master_report_adapter,
+            &mut project_info_adapter,
+            &mut docs_attach_adapter,
+            &mut task_check_adapter,
+        );
+
+        assert_eq!(selected_backend, BackendKind::Claude);
+        assert_eq!(
+            model_routing.base_command_config().backend_kind(),
+            BackendKind::Claude
+        );
+        let expected_program = model_routing.base_command_config().program;
+        assert_eq!(master_adapter.program(), expected_program);
+        assert_eq!(master_report_adapter.program(), expected_program);
+        assert_eq!(project_info_adapter.program(), expected_program);
+        assert_eq!(docs_attach_adapter.program(), expected_program);
+        assert_eq!(task_check_adapter.program(), expected_program);
+        assert!(active_worker_context_key.is_none());
+        assert!(worker_agent_adapters.is_empty());
+        let last = app.left_bottom_lines().last().expect("status message");
+        assert!(last.contains("Backend set to Claude for this run"));
+        assert!(last.contains("persistence to ~/.metaagent/config.toml failed"));
+        assert!(last.contains("New adapters in this run will still use this backend."));
+    });
 }
 
 #[test]

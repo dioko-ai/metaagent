@@ -30,9 +30,10 @@ mod theme;
 mod ui;
 mod workflow;
 
-use agent::{AdapterOutputMode, AgentEvent, CodexAdapter, CodexCommandConfig};
+use agent::{AdapterOutputMode, AgentEvent, BackendKind, CodexAdapter, CodexCommandConfig};
 use agent_models::{CodexAgentKind, CodexAgentModelRouting, CodexModelProfile};
-use app::{App, Pane, ResumeSessionOption, RightPaneMode};
+use app::{App, BackendOption, Pane, ResumeSessionOption, RightPaneMode};
+use artifact_io::{ensure_default_metaagent_config, load_merged_metaagent_config_text};
 use deterministic::TestRunnerAdapter;
 use events::AppEvent;
 use services::{
@@ -76,17 +77,36 @@ const UI_TICK_INTERVAL: Duration = Duration::from_millis(120);
 type PendingTaskWriteBaseline = TaskWriteBaseline;
 
 fn apply_codex_profile(config: &mut CodexCommandConfig, profile: &CodexModelProfile) {
+    if !matches!(config.backend_kind(), BackendKind::Codex) {
+        return;
+    }
     config.model = Some(profile.model.clone());
     config.model_reasoning_effort = profile.thinking_effort.clone();
 }
 
+fn base_command_config_for_backend(
+    model_routing: &CodexAgentModelRouting,
+    selected_backend: BackendKind,
+) -> CodexCommandConfig {
+    let config = model_routing.base_command_config();
+    if config.backend_kind() == selected_backend {
+        config
+    } else {
+        CodexCommandConfig::default_for_backend(selected_backend)
+    }
+}
+
 fn build_codex_adapter(
+    model_routing: &CodexAgentModelRouting,
+    selected_backend: BackendKind,
     output_mode: AdapterOutputMode,
     persistent_session: bool,
     profile: &CodexModelProfile,
 ) -> CodexAdapter {
-    let mut config = CodexCommandConfig::default();
-    if matches!(output_mode, AdapterOutputMode::JsonAssistantOnly) {
+    let mut config = base_command_config_for_backend(model_routing, selected_backend);
+    if matches!(output_mode, AdapterOutputMode::JsonAssistantOnly)
+        && matches!(config.backend_kind(), BackendKind::Codex)
+    {
         config.args_prefix.push("--json".to_string());
     }
     config.output_mode = output_mode;
@@ -97,29 +117,40 @@ fn build_codex_adapter(
 
 fn build_json_persistent_adapter(
     model_routing: &CodexAgentModelRouting,
+    selected_backend: BackendKind,
     kind: CodexAgentKind,
 ) -> CodexAdapter {
     let profile = model_routing.profile_for(kind);
-    build_codex_adapter(AdapterOutputMode::JsonAssistantOnly, true, &profile)
+    build_codex_adapter(
+        model_routing,
+        selected_backend,
+        AdapterOutputMode::JsonAssistantOnly,
+        true,
+        &profile,
+    )
 }
 
 fn build_plain_adapter(
     model_routing: &CodexAgentModelRouting,
+    selected_backend: BackendKind,
     kind: CodexAgentKind,
     persistent_session: bool,
 ) -> CodexAdapter {
     let profile = model_routing.profile_for(kind);
-    build_codex_adapter(AdapterOutputMode::PlainText, persistent_session, &profile)
+    build_codex_adapter(
+        model_routing,
+        selected_backend,
+        AdapterOutputMode::PlainText,
+        persistent_session,
+        &profile,
+    )
 }
 
 fn main() -> io::Result<()> {
     let launch_options = parse_launch_options(std::env::args().skip(1))?;
     if let Some(command) = launch_options.command {
-        let exit_code = run_cli_command(
-            command,
-            launch_options.output_mode,
-            launch_options.verbose,
-        );
+        let exit_code =
+            run_cli_command(command, launch_options.output_mode, launch_options.verbose);
         std::process::exit(exit_code);
     }
     let startup_message = if let Some(path) = launch_options.send_file {
@@ -174,7 +205,7 @@ fn run_app(
     let prompt_service = DefaultUiPromptService;
 
     let mut session_store: Option<SessionStore> = None;
-    let model_routing = match CodexAgentModelRouting::load_from_metaagent_config() {
+    let mut model_routing = match CodexAgentModelRouting::load_from_metaagent_config() {
         Ok(config) => config,
         Err(err) => {
             app.push_agent_message(format!(
@@ -183,16 +214,22 @@ fn run_app(
             CodexAgentModelRouting::default()
         }
     };
-    let master_adapter = build_json_persistent_adapter(&model_routing, CodexAgentKind::Master);
-    let master_report_adapter =
-        build_json_persistent_adapter(&model_routing, CodexAgentKind::MasterReport);
-    let project_info_adapter =
-        build_json_persistent_adapter(&model_routing, CodexAgentKind::ProjectInfo);
+    let mut selected_backend = model_routing.base_command_config().backend_kind();
+    let mut master_adapter = build_json_persistent_adapter(
+        &model_routing,
+        selected_backend,
+        CodexAgentKind::Master,
+    );
+    let mut master_report_adapter =
+        build_json_persistent_adapter(&model_routing, selected_backend, CodexAgentKind::MasterReport);
+    let mut project_info_adapter =
+        build_json_persistent_adapter(&model_routing, selected_backend, CodexAgentKind::ProjectInfo);
     let mut worker_agent_adapters: HashMap<String, CodexAdapter> = HashMap::new();
     let mut active_worker_context_key: Option<String> = None;
-    let docs_attach_adapter =
-        build_plain_adapter(&model_routing, CodexAgentKind::DocsAttach, false);
-    let task_check_adapter = build_plain_adapter(&model_routing, CodexAgentKind::TaskCheck, false);
+    let mut docs_attach_adapter =
+        build_plain_adapter(&model_routing, selected_backend, CodexAgentKind::DocsAttach, false);
+    let mut task_check_adapter =
+        build_plain_adapter(&model_routing, selected_backend, CodexAgentKind::TaskCheck, false);
     let test_runner_adapter = TestRunnerAdapter::new();
     let mut master_transcript: Vec<String> = Vec::new();
     let mut master_report_transcript: Vec<String> = Vec::new();
@@ -215,7 +252,7 @@ fn run_app(
     if let Some(message) = startup_message
         && let Some(message) = app.submit_direct_message(message)
     {
-        submit_user_message(
+        submit_user_message_with_runtime(
             &mut app,
             message,
             &master_adapter,
@@ -241,7 +278,8 @@ fn run_app(
             &mut project_info_in_flight,
             &mut project_info_stage,
             &mut project_info_text,
-            &model_routing,
+            &mut model_routing,
+            &mut selected_backend,
         )?;
     }
 
@@ -253,42 +291,42 @@ fn run_app(
 
         if !input_pending {
             for event in master_adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP) {
-            match event {
-                AgentEvent::Output(line) => {
-                    master_transcript.push(line.clone());
-                    app.push_agent_message(format!("Agent: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::System(line) => {
-                    app.push_agent_message(format!("System: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::Completed { .. } => {
-                    let Some(active_session) = session_store.as_ref() else {
-                        app.set_master_in_progress(false);
-                        master_transcript.clear();
+                match event {
+                    AgentEvent::Output(line) => {
+                        master_transcript.push(line.clone());
+                        app.push_agent_message(format!("Agent: {line}"));
                         chat_updated = true;
-                        continue;
-                    };
-                    app.set_master_in_progress(false);
-                    let _transcript = master_transcript.join("\n");
-                    master_transcript.clear();
-                    let baseline_tasks_text = pending_task_write_baseline
-                        .as_ref()
-                        .map(|b| b.tasks_json.clone());
-                    let mut tasks_refresh_ok = false;
-                    let mut requested_task_file_retry = false;
-                    if should_process_master_task_file_updates(app.is_execution_busy()) {
-                        match active_session.read_tasks() {
-                            Ok(mut tasks) => {
-                                let docs_sanitized = sanitize_master_docs_fields(
-                                    &mut tasks,
-                                    pending_task_write_baseline
-                                        .as_ref()
-                                        .map(|b| b.tasks_json.as_str()),
-                                );
-                                if docs_sanitized {
-                                    match serde_json::to_string_pretty(&tasks) {
+                    }
+                    AgentEvent::System(line) => {
+                        app.push_agent_message(format!("System: {line}"));
+                        chat_updated = true;
+                    }
+                    AgentEvent::Completed { .. } => {
+                        let Some(active_session) = session_store.as_ref() else {
+                            app.set_master_in_progress(false);
+                            master_transcript.clear();
+                            chat_updated = true;
+                            continue;
+                        };
+                        app.set_master_in_progress(false);
+                        let _transcript = master_transcript.join("\n");
+                        master_transcript.clear();
+                        let baseline_tasks_text = pending_task_write_baseline
+                            .as_ref()
+                            .map(|b| b.tasks_json.clone());
+                        let mut tasks_refresh_ok = false;
+                        let mut requested_task_file_retry = false;
+                        if should_process_master_task_file_updates(app.is_execution_busy()) {
+                            match active_session.read_tasks() {
+                                Ok(mut tasks) => {
+                                    let docs_sanitized = sanitize_master_docs_fields(
+                                        &mut tasks,
+                                        pending_task_write_baseline
+                                            .as_ref()
+                                            .map(|b| b.tasks_json.as_str()),
+                                    );
+                                    if docs_sanitized {
+                                        match serde_json::to_string_pretty(&tasks) {
                                         Ok(text) => {
                                             if let Err(err) =
                                                 std::fs::write(active_session.tasks_file(), text)
@@ -307,35 +345,35 @@ fn run_app(
                                             "System: Failed to serialize tasks.json after docs sanitization: {err}"
                                         )),
                                     }
-                                }
-                                match app.sync_planner_tasks_from_file(tasks) {
-                                    Ok(()) => {
-                                        tasks_refresh_ok = true;
-                                        task_file_fix_retry_count = 0;
                                     }
-                                    Err(err) => {
-                                        app.push_agent_message(format!(
+                                    match app.sync_planner_tasks_from_file(tasks) {
+                                        Ok(()) => {
+                                            tasks_refresh_ok = true;
+                                            task_file_fix_retry_count = 0;
+                                        }
+                                        Err(err) => {
+                                            app.push_agent_message(format!(
                                             "System: Failed to refresh task tree from tasks.json: {err}"
                                         ));
+                                        }
                                     }
                                 }
-                            }
-                            Err(err) => {
-                                app.push_agent_message(format!(
+                                Err(err) => {
+                                    app.push_agent_message(format!(
                                     "System: Failed to read tasks.json after master update: {err}"
                                 ));
+                                }
                             }
-                        }
-                        if let Ok(markdown) = active_session.read_planner_markdown() {
-                            app.set_planner_markdown(markdown);
-                        }
+                            if let Ok(markdown) = active_session.read_planner_markdown() {
+                                app.set_planner_markdown(markdown);
+                            }
 
-                        if !tasks_refresh_ok {
-                            if task_file_fix_retry_count < 2 {
-                                task_file_fix_retry_count =
-                                    task_file_fix_retry_count.saturating_add(1);
-                                requested_task_file_retry = true;
-                                master_adapter.send_prompt(
+                            if !tasks_refresh_ok {
+                                if task_file_fix_retry_count < 2 {
+                                    task_file_fix_retry_count =
+                                        task_file_fix_retry_count.saturating_add(1);
+                                    requested_task_file_retry = true;
+                                    master_adapter.send_prompt(
                                     subagents::build_session_intro_if_needed(
                                         "tasks.json failed to parse/validate. Fix tasks.json immediately and retry. \
                                      Ensure id and parent_id are valid values and hierarchy is valid. \
@@ -350,55 +388,57 @@ fn run_app(
                                         &mut master_session_intro_needed,
                                     ),
                                 );
-                                app.set_master_in_progress(true);
-                                app.push_agent_message(format!(
+                                    app.set_master_in_progress(true);
+                                    app.push_agent_message(format!(
                                     "System: Requested tasks.json correction from master (attempt {}).",
                                     task_file_fix_retry_count
                                 ));
-                            } else {
-                                app.push_agent_message(
+                                } else {
+                                    app.push_agent_message(
                                     "System: tasks.json correction retries exceeded. Waiting for next user input."
                                         .to_string(),
                                 );
-                                task_file_fix_retry_count = 0;
+                                    task_file_fix_retry_count = 0;
+                                }
                             }
                         }
-                    }
-                    let changed_tasks = if tasks_refresh_ok {
-                        tasks_changed_since_baseline(
-                            baseline_tasks_text.as_deref(),
-                            std::fs::read_to_string(active_session.tasks_file())
-                                .ok()
-                                .as_deref(),
-                        )
-                    } else {
-                        false
-                    };
-                    if should_clear_task_write_baseline(tasks_refresh_ok, requested_task_file_retry)
-                    {
-                        pending_task_write_baseline = None;
-                    }
-
-                    if tasks_refresh_ok {
-                        if should_start_task_check(
-                            changed_tasks,
-                            task_check_in_flight,
-                            docs_attach_in_flight,
+                        let changed_tasks = if tasks_refresh_ok {
+                            tasks_changed_since_baseline(
+                                baseline_tasks_text.as_deref(),
+                                std::fs::read_to_string(active_session.tasks_file())
+                                    .ok()
+                                    .as_deref(),
+                            )
+                        } else {
+                            false
+                        };
+                        if should_clear_task_write_baseline(
+                            tasks_refresh_ok,
+                            requested_task_file_retry,
                         ) {
-                            task_check_in_flight = true;
-                            task_check_baseline =
-                                std::fs::read_to_string(active_session.tasks_file()).ok();
-                            app.set_task_check_in_progress(true);
-                            app.push_subagent_output(
-                                "TaskCheckSystem: Checking updated tasks.json".to_string(),
-                            );
-                            task_check_adapter.send_prompt(subagents::build_task_check_prompt(
-                                &active_session.tasks_file().display().to_string(),
-                                &active_session.project_info_file().display().to_string(),
-                                &active_session.session_meta_file().display().to_string(),
-                            ));
+                            pending_task_write_baseline = None;
                         }
-                        match orchestration_service.start_next_worker_job_if_any(
+
+                        if tasks_refresh_ok {
+                            if should_start_task_check(
+                                changed_tasks,
+                                task_check_in_flight,
+                                docs_attach_in_flight,
+                            ) {
+                                task_check_in_flight = true;
+                                task_check_baseline =
+                                    std::fs::read_to_string(active_session.tasks_file()).ok();
+                                app.set_task_check_in_progress(true);
+                                app.push_subagent_output(
+                                    "TaskCheckSystem: Checking updated tasks.json".to_string(),
+                                );
+                                task_check_adapter.send_prompt(subagents::build_task_check_prompt(
+                                    &active_session.tasks_file().display().to_string(),
+                                    &active_session.project_info_file().display().to_string(),
+                                    &active_session.session_meta_file().display().to_string(),
+                                ));
+                            }
+                            match orchestration_service.start_next_worker_job_if_any(
                             &mut app,
                             &mut worker_agent_adapters,
                             &mut active_worker_context_key,
@@ -415,11 +455,11 @@ fn run_app(
                                 "System: Failed to persist runtime task status to tasks.json: {err}"
                             )),
                         }
+                        }
+                        chat_updated = true;
                     }
-                    chat_updated = true;
                 }
             }
-        }
         }
 
         if !input_pending {
@@ -429,398 +469,407 @@ fn run_app(
                 .map(|adapter| adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP))
                 .unwrap_or_default();
             for event in worker_events {
-            match event {
-                AgentEvent::Output(line) => {
-                    app.on_worker_output(line);
-                    chat_updated = true;
-                }
-                AgentEvent::System(line) => {
-                    app.on_worker_system_output(line);
-                    chat_updated = true;
-                }
-                AgentEvent::Completed { success, code } => {
-                    let Some(active_session) = session_store.as_ref() else {
-                        active_worker_context_key = None;
-                        let _ = app.on_worker_completed(success, code);
+                match event {
+                    AgentEvent::Output(line) => {
+                        app.on_worker_output(line);
                         chat_updated = true;
-                        continue;
-                    };
-                    if let Some(key) = active_worker_context_key.as_ref()
-                        && let Some(adapter) = worker_agent_adapters.get(key)
-                    {
-                        for tail_event in drain_post_completion_worker_events(adapter) {
-                            match tail_event {
-                                AgentEvent::Output(line) => {
-                                    app.on_worker_output(line);
+                    }
+                    AgentEvent::System(line) => {
+                        app.on_worker_system_output(line);
+                        chat_updated = true;
+                    }
+                    AgentEvent::Completed { success, code } => {
+                        let Some(active_session) = session_store.as_ref() else {
+                            active_worker_context_key = None;
+                            let _ = app.on_worker_completed(success, code);
+                            chat_updated = true;
+                            continue;
+                        };
+                        if let Some(key) = active_worker_context_key.as_ref()
+                            && let Some(adapter) = worker_agent_adapters.get(key)
+                        {
+                            for tail_event in drain_post_completion_worker_events(adapter) {
+                                match tail_event {
+                                    AgentEvent::Output(line) => {
+                                        app.on_worker_output(line);
+                                    }
+                                    AgentEvent::System(line) => {
+                                        app.on_worker_system_output(line);
+                                    }
+                                    AgentEvent::Completed { .. } => {}
                                 }
-                                AgentEvent::System(line) => {
-                                    app.on_worker_system_output(line);
-                                }
-                                AgentEvent::Completed { .. } => {}
                             }
                         }
-                    }
-                    active_worker_context_key = None;
-                    let outcome = orchestration_service.complete_worker_cycle_and_start_next(
-                        &mut app,
-                        success,
-                        code,
-                        &mut worker_agent_adapters,
-                        &mut active_worker_context_key,
-                        &test_runner_adapter,
-                        active_session,
-                        &model_routing,
-                        &mut master_report_session_intro_needed,
-                        project_info_text.as_deref(),
-                    );
-                    for warning in outcome.warnings {
-                        app.push_agent_message(format!("System: {warning}"));
-                    }
-                    for prompt in [outcome.failure_report_prompt, outcome.context_report_prompt]
-                        .into_iter()
-                        .flatten()
-                    {
-                        if let Some(prompt_to_send) = enqueue_or_dispatch_master_report_prompt(
-                            prompt,
-                            &mut master_report_in_flight,
-                            &mut pending_master_report_prompts,
-                        ) {
-                            master_report_transcript.clear();
-                            master_report_adapter.send_prompt(prompt_to_send);
+                        active_worker_context_key = None;
+                        let outcome = orchestration_service.complete_worker_cycle_and_start_next(
+                            &mut app,
+                            success,
+                            code,
+                            &mut worker_agent_adapters,
+                            &mut active_worker_context_key,
+                            &test_runner_adapter,
+                            active_session,
+                            &model_routing,
+                            &mut master_report_session_intro_needed,
+                            project_info_text.as_deref(),
+                        );
+                        for warning in outcome.warnings {
+                            app.push_agent_message(format!("System: {warning}"));
                         }
+                        for prompt in [outcome.failure_report_prompt, outcome.context_report_prompt]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(prompt_to_send) = enqueue_or_dispatch_master_report_prompt(
+                                prompt,
+                                &mut master_report_in_flight,
+                                &mut pending_master_report_prompts,
+                            ) {
+                                master_report_transcript.clear();
+                                master_report_adapter.send_prompt(prompt_to_send);
+                            }
+                        }
+                        if let Some(job) = outcome.started_job {
+                            app.push_agent_message(format!(
+                                "System: Starting {:?} for task #{}.",
+                                job.role, job.top_task_id
+                            ));
+                        }
+                        chat_updated = true;
                     }
-                    if let Some(job) = outcome.started_job {
-                        app.push_agent_message(format!(
-                            "System: Starting {:?} for task #{}.",
-                            job.role, job.top_task_id
-                        ));
-                    }
-                    chat_updated = true;
                 }
             }
-        }
         }
 
         if !input_pending {
             for event in test_runner_adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP) {
-            match event {
-                AgentEvent::Output(line) => {
-                    app.on_worker_output(line);
-                    chat_updated = true;
-                }
-                AgentEvent::System(line) => {
-                    app.on_worker_system_output(line);
-                    chat_updated = true;
-                }
-                AgentEvent::Completed { success, code } => {
-                    let Some(active_session) = session_store.as_ref() else {
-                        let _ = app.on_worker_completed(success, code);
+                match event {
+                    AgentEvent::Output(line) => {
+                        app.on_worker_output(line);
                         chat_updated = true;
-                        continue;
-                    };
-                    let outcome = orchestration_service.complete_worker_cycle_and_start_next(
-                        &mut app,
-                        success,
-                        code,
-                        &mut worker_agent_adapters,
-                        &mut active_worker_context_key,
-                        &test_runner_adapter,
-                        active_session,
-                        &model_routing,
-                        &mut master_report_session_intro_needed,
-                        project_info_text.as_deref(),
-                    );
-                    for warning in outcome.warnings {
-                        app.push_agent_message(format!("System: {warning}"));
                     }
-                    for prompt in [outcome.failure_report_prompt, outcome.context_report_prompt]
-                        .into_iter()
-                        .flatten()
-                    {
-                        if let Some(prompt_to_send) = enqueue_or_dispatch_master_report_prompt(
-                            prompt,
+                    AgentEvent::System(line) => {
+                        app.on_worker_system_output(line);
+                        chat_updated = true;
+                    }
+                    AgentEvent::Completed { success, code } => {
+                        let Some(active_session) = session_store.as_ref() else {
+                            let _ = app.on_worker_completed(success, code);
+                            chat_updated = true;
+                            continue;
+                        };
+                        let outcome = orchestration_service.complete_worker_cycle_and_start_next(
+                            &mut app,
+                            success,
+                            code,
+                            &mut worker_agent_adapters,
+                            &mut active_worker_context_key,
+                            &test_runner_adapter,
+                            active_session,
+                            &model_routing,
+                            &mut master_report_session_intro_needed,
+                            project_info_text.as_deref(),
+                        );
+                        for warning in outcome.warnings {
+                            app.push_agent_message(format!("System: {warning}"));
+                        }
+                        for prompt in [outcome.failure_report_prompt, outcome.context_report_prompt]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(prompt_to_send) = enqueue_or_dispatch_master_report_prompt(
+                                prompt,
+                                &mut master_report_in_flight,
+                                &mut pending_master_report_prompts,
+                            ) {
+                                master_report_transcript.clear();
+                                master_report_adapter.send_prompt(prompt_to_send);
+                            }
+                        }
+                        if let Some(job) = outcome.started_job {
+                            app.push_agent_message(format!(
+                                "System: Starting {:?} for task #{}.",
+                                job.role, job.top_task_id
+                            ));
+                        }
+                        chat_updated = true;
+                    }
+                }
+            }
+        }
+
+        if !input_pending {
+            for event in master_report_adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP) {
+                match event {
+                    AgentEvent::Output(line) => {
+                        master_report_transcript.push(line);
+                    }
+                    AgentEvent::System(_line) => {}
+                    AgentEvent::Completed { .. } => {
+                        let summary = master_report_transcript
+                            .iter()
+                            .rev()
+                            .find(|line| !line.trim().is_empty())
+                            .map(|line| format_internal_master_update(line))
+                            .unwrap_or_else(|| {
+                                "Here's what just happened: a sub-agent completed work.".to_string()
+                            });
+                        app.push_agent_message(format!("Agent: {summary}"));
+                        master_report_transcript.clear();
+                        if let Some(prompt_to_send) = complete_and_next_master_report_prompt(
                             &mut master_report_in_flight,
                             &mut pending_master_report_prompts,
                         ) {
                             master_report_transcript.clear();
                             master_report_adapter.send_prompt(prompt_to_send);
                         }
+                        chat_updated = true;
                     }
-                    if let Some(job) = outcome.started_job {
-                        app.push_agent_message(format!(
-                            "System: Starting {:?} for task #{}.",
-                            job.role, job.top_task_id
-                        ));
-                    }
-                    chat_updated = true;
                 }
             }
-        }
-        }
-
-        if !input_pending {
-            for event in master_report_adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP) {
-            match event {
-                AgentEvent::Output(line) => {
-                    master_report_transcript.push(line);
-                }
-                AgentEvent::System(_line) => {}
-                AgentEvent::Completed { .. } => {
-                    let summary = master_report_transcript
-                        .iter()
-                        .rev()
-                        .find(|line| !line.trim().is_empty())
-                        .map(|line| format_internal_master_update(line))
-                        .unwrap_or_else(|| {
-                            "Here's what just happened: a sub-agent completed work.".to_string()
-                        });
-                    app.push_agent_message(format!("Agent: {summary}"));
-                    master_report_transcript.clear();
-                    if let Some(prompt_to_send) = complete_and_next_master_report_prompt(
-                        &mut master_report_in_flight,
-                        &mut pending_master_report_prompts,
-                    ) {
-                        master_report_transcript.clear();
-                        master_report_adapter.send_prompt(prompt_to_send);
-                    }
-                    chat_updated = true;
-                }
-            }
-        }
         }
 
         if !input_pending {
             for event in project_info_adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP) {
-            match event {
-                AgentEvent::Output(line) => {
-                    project_info_transcript.push(line.clone());
-                    app.push_subagent_output(format!("ProjectInfo: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::System(line) => {
-                    app.push_subagent_output(format!("ProjectInfoSystem: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::Completed { success, code } => {
-                    let Some(active_session) = session_store.as_ref() else {
-                        project_info_stage = None;
-                        project_info_in_flight = false;
-                        project_info_transcript.clear();
+                match event {
+                    AgentEvent::Output(line) => {
+                        project_info_transcript.push(line.clone());
+                        app.push_subagent_output(format!("ProjectInfo: {line}"));
                         chat_updated = true;
-                        continue;
-                    };
-                    match project_info_stage {
-                        Some(ProjectInfoStage::GatheringInfo) => {
-                            if success {
-                                let gathered = match active_session.read_project_info() {
-                                    Ok(file_text) if !file_text.trim().is_empty() => {
-                                        Some(file_text)
-                                    }
-                                    Ok(_) => None,
-                                    Err(err) => {
-                                        app.push_agent_message(format!(
+                    }
+                    AgentEvent::System(line) => {
+                        app.push_subagent_output(format!("ProjectInfoSystem: {line}"));
+                        chat_updated = true;
+                    }
+                    AgentEvent::Completed { success, code } => {
+                        let Some(active_session) = session_store.as_ref() else {
+                            project_info_stage = None;
+                            project_info_in_flight = false;
+                            project_info_transcript.clear();
+                            chat_updated = true;
+                            continue;
+                        };
+                        match project_info_stage {
+                            Some(ProjectInfoStage::GatheringInfo) => {
+                                if success {
+                                    let gathered = match active_session.read_project_info() {
+                                        Ok(file_text) if !file_text.trim().is_empty() => {
+                                            Some(file_text)
+                                        }
+                                        Ok(_) => None,
+                                        Err(err) => {
+                                            app.push_agent_message(format!(
                                             "System: Project info run succeeded but reading project-info.md failed: {err}"
                                         ));
-                                        None
-                                    }
-                                };
-                                if let Some(markdown) = gathered {
-                                    project_info_text = Some(markdown);
-                                    app.push_agent_message(
+                                            None
+                                        }
+                                    };
+                                    if let Some(markdown) = gathered {
+                                        project_info_text = Some(markdown);
+                                        app.push_agent_message(
                                         "System: Project context gathered and attached for this session."
                                             .to_string(),
                                     );
-                                } else if !project_info_transcript.is_empty() {
-                                    let markdown = project_info_transcript.join("\n");
-                                    if let Err(err) = active_session.write_project_info(&markdown) {
-                                        app.push_agent_message(format!(
+                                    } else if !project_info_transcript.is_empty() {
+                                        let markdown = project_info_transcript.join("\n");
+                                        if let Err(err) =
+                                            active_session.write_project_info(&markdown)
+                                        {
+                                            app.push_agent_message(format!(
                                             "System: Failed to persist project-info.md fallback output: {err}"
                                         ));
-                                    } else {
-                                        project_info_text = Some(markdown);
-                                        app.push_agent_message(
+                                        } else {
+                                            project_info_text = Some(markdown);
+                                            app.push_agent_message(
                                             "System: Project context gathered and attached for this session."
                                                 .to_string(),
                                         );
-                                    }
-                                } else {
-                                    app.push_agent_message(
+                                        }
+                                    } else {
+                                        app.push_agent_message(
                                         "System: Project context run returned no content; proceeding without attachment."
                                             .to_string(),
                                     );
-                                }
+                                    }
 
-                                if let Some(original_prompt) =
-                                    pending_master_message_after_project_info.as_deref()
-                                {
-                                    let meta_prompt = subagents::build_session_meta_prompt(
-                                        original_prompt,
-                                        &active_session.session_meta_file().display().to_string(),
-                                    );
-                                    project_info_adapter.send_prompt(meta_prompt);
-                                    project_info_stage = Some(ProjectInfoStage::WritingSessionMeta);
-                                    app.push_subagent_output(
-                                        "ProjectInfoSystem: Writing session meta.json".to_string(),
-                                    );
-                                    project_info_transcript.clear();
-                                    chat_updated = true;
-                                    continue;
-                                }
-                            } else {
-                                app.push_agent_message(format!(
+                                    if let Some(original_prompt) =
+                                        pending_master_message_after_project_info.as_deref()
+                                    {
+                                        let meta_prompt = subagents::build_session_meta_prompt(
+                                            original_prompt,
+                                            &active_session
+                                                .session_meta_file()
+                                                .display()
+                                                .to_string(),
+                                        );
+                                        project_info_adapter.send_prompt(meta_prompt);
+                                        project_info_stage =
+                                            Some(ProjectInfoStage::WritingSessionMeta);
+                                        app.push_subagent_output(
+                                            "ProjectInfoSystem: Writing session meta.json"
+                                                .to_string(),
+                                        );
+                                        project_info_transcript.clear();
+                                        chat_updated = true;
+                                        continue;
+                                    }
+                                } else {
+                                    app.push_agent_message(format!(
                                     "System: Project context gather exited with code {code}; proceeding without attachment."
                                 ));
-                            }
-                        }
-                        Some(ProjectInfoStage::WritingSessionMeta) => {
-                            if success {
-                                if let Ok(meta) = active_session.read_session_meta() {
-                                    app.push_agent_message(format!(
-                                        "System: Session metadata saved: \"{}\" ({})",
-                                        meta.title, meta.created_at
-                                    ));
-                                } else {
-                                    app.push_agent_message(
-                                        "System: Session metadata write completed.".to_string(),
-                                    );
                                 }
-                            } else {
-                                app.push_agent_message(format!(
+                            }
+                            Some(ProjectInfoStage::WritingSessionMeta) => {
+                                if success {
+                                    if let Ok(meta) = active_session.read_session_meta() {
+                                        app.push_agent_message(format!(
+                                            "System: Session metadata saved: \"{}\" ({})",
+                                            meta.title, meta.created_at
+                                        ));
+                                    } else {
+                                        app.push_agent_message(
+                                            "System: Session metadata write completed.".to_string(),
+                                        );
+                                    }
+                                } else {
+                                    app.push_agent_message(format!(
                                     "System: Session metadata write exited with code {code}; continuing."
                                 ));
+                                }
                             }
+                            None => {}
                         }
-                        None => {}
+
+                        project_info_stage = None;
+                        project_info_in_flight = false;
+
+                        if let Some(pending_message) =
+                            pending_master_message_after_project_info.take()
+                        {
+                            let with_intro = prompt_service.build_master_prompt_for_message(
+                                &app,
+                                &pending_message,
+                                active_session,
+                                project_info_text.as_deref(),
+                                &mut master_session_intro_needed,
+                            );
+                            master_adapter.send_prompt(with_intro);
+                            app.set_master_in_progress(true);
+                            pending_task_write_baseline =
+                                orchestration_service.capture_tasks_baseline(active_session);
+                        }
+
+                        project_info_transcript.clear();
+                        chat_updated = true;
                     }
-
-                    project_info_stage = None;
-                    project_info_in_flight = false;
-
-                    if let Some(pending_message) = pending_master_message_after_project_info.take()
-                    {
-                        let with_intro = prompt_service.build_master_prompt_for_message(
-                            &app,
-                            &pending_message,
-                            active_session,
-                            project_info_text.as_deref(),
-                            &mut master_session_intro_needed,
-                        );
-                        master_adapter.send_prompt(with_intro);
-                        app.set_master_in_progress(true);
-                        pending_task_write_baseline =
-                            orchestration_service.capture_tasks_baseline(active_session);
-                    }
-
-                    project_info_transcript.clear();
-                    chat_updated = true;
                 }
             }
-        }
         }
 
         if !input_pending {
             for event in docs_attach_adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP) {
-            match event {
-                AgentEvent::Output(line) => {
-                    app.push_subagent_output(format!("Docs: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::System(line) => {
-                    app.push_subagent_output(format!("DocsSystem: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::Completed { success, code } => {
-                    docs_attach_in_flight = false;
-                    app.set_docs_attach_in_progress(false);
-                    let Some(active_session) = session_store.as_ref() else {
+                match event {
+                    AgentEvent::Output(line) => {
+                        app.push_subagent_output(format!("Docs: {line}"));
                         chat_updated = true;
-                        continue;
-                    };
-                    match active_session.read_tasks() {
-                        Ok(tasks) => match app.sync_planner_tasks_from_file(tasks) {
-                            Ok(_) => {
-                                if success {
-                                    app.push_agent_message(
+                    }
+                    AgentEvent::System(line) => {
+                        app.push_subagent_output(format!("DocsSystem: {line}"));
+                        chat_updated = true;
+                    }
+                    AgentEvent::Completed { success, code } => {
+                        docs_attach_in_flight = false;
+                        app.set_docs_attach_in_progress(false);
+                        let Some(active_session) = session_store.as_ref() else {
+                            chat_updated = true;
+                            continue;
+                        };
+                        match active_session.read_tasks() {
+                            Ok(tasks) => match app.sync_planner_tasks_from_file(tasks) {
+                                Ok(_) => {
+                                    if success {
+                                        app.push_agent_message(
                                         "System: Documentation has been attached to planner tasks."
                                             .to_string(),
                                     );
-                                } else {
-                                    app.push_agent_message(format!(
+                                    } else {
+                                        app.push_agent_message(format!(
                                         "System: Documentation attach run exited with code {code}."
                                     ));
+                                    }
                                 }
-                            }
+                                Err(err) => app.push_agent_message(format!(
+                                    "System: Docs attach completed but task refresh failed: {err}"
+                                )),
+                            },
                             Err(err) => app.push_agent_message(format!(
-                                "System: Docs attach completed but task refresh failed: {err}"
+                                "System: Docs attach completed but reading tasks.json failed: {err}"
                             )),
-                        },
-                        Err(err) => app.push_agent_message(format!(
-                            "System: Docs attach completed but reading tasks.json failed: {err}"
-                        )),
+                        }
+                        chat_updated = true;
                     }
-                    chat_updated = true;
                 }
             }
-        }
         }
         if !input_pending {
             for event in task_check_adapter.drain_events_limited(MAX_ADAPTER_EVENTS_PER_LOOP) {
-            match event {
-                AgentEvent::Output(line) => {
-                    app.push_subagent_output(format!("TaskCheck: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::System(line) => {
-                    app.push_subagent_output(format!("TaskCheckSystem: {line}"));
-                    chat_updated = true;
-                }
-                AgentEvent::Completed { success, code } => {
-                    task_check_in_flight = false;
-                    app.set_task_check_in_progress(false);
-                    let Some(active_session) = session_store.as_ref() else {
-                        task_check_baseline = None;
+                match event {
+                    AgentEvent::Output(line) => {
+                        app.push_subagent_output(format!("TaskCheck: {line}"));
                         chat_updated = true;
-                        continue;
-                    };
-                    let after_text = std::fs::read_to_string(active_session.tasks_file()).ok();
-                    let changed = match (task_check_baseline.as_deref(), after_text.as_deref()) {
-                        (Some(before), Some(after)) => before != after,
-                        _ => false,
-                    };
-                    task_check_baseline = None;
-                    if let Ok(tasks) = active_session.read_tasks() {
-                        match app.sync_planner_tasks_from_file(tasks) {
-                            Ok(()) => {
-                                if changed {
-                                    app.push_agent_message(
-                                        "System: Task checker applied fixes to tasks.json."
-                                            .to_string(),
-                                    );
+                    }
+                    AgentEvent::System(line) => {
+                        app.push_subagent_output(format!("TaskCheckSystem: {line}"));
+                        chat_updated = true;
+                    }
+                    AgentEvent::Completed { success, code } => {
+                        task_check_in_flight = false;
+                        app.set_task_check_in_progress(false);
+                        let Some(active_session) = session_store.as_ref() else {
+                            task_check_baseline = None;
+                            chat_updated = true;
+                            continue;
+                        };
+                        let after_text = std::fs::read_to_string(active_session.tasks_file()).ok();
+                        let changed = match (task_check_baseline.as_deref(), after_text.as_deref())
+                        {
+                            (Some(before), Some(after)) => before != after,
+                            _ => false,
+                        };
+                        task_check_baseline = None;
+                        if let Ok(tasks) = active_session.read_tasks() {
+                            match app.sync_planner_tasks_from_file(tasks) {
+                                Ok(()) => {
+                                    if changed {
+                                        app.push_agent_message(
+                                            "System: Task checker applied fixes to tasks.json."
+                                                .to_string(),
+                                        );
+                                    }
                                 }
+                                Err(err) => app.push_agent_message(format!(
+                                    "System: Task checker completed but task refresh failed: {err}"
+                                )),
                             }
-                            Err(err) => app.push_agent_message(format!(
-                                "System: Task checker completed but task refresh failed: {err}"
-                            )),
+                        } else {
+                            app.push_agent_message(
+                                "System: Task checker completed but tasks.json could not be read."
+                                    .to_string(),
+                            );
                         }
-                    } else {
-                        app.push_agent_message(
-                            "System: Task checker completed but tasks.json could not be read."
-                                .to_string(),
-                        );
+                        if success {
+                            app.push_subagent_output(
+                                "TaskCheckSystem: Task check complete.".to_string(),
+                            );
+                        } else {
+                            app.push_subagent_output(format!(
+                                "TaskCheckSystem: Task check exited with code {code}."
+                            ));
+                        }
+                        chat_updated = true;
                     }
-                    if success {
-                        app.push_subagent_output(
-                            "TaskCheckSystem: Task check complete.".to_string(),
-                        );
-                    } else {
-                        app.push_subagent_output(format!(
-                            "TaskCheckSystem: Task check exited with code {code}."
-                        ));
-                    }
-                    chat_updated = true;
                 }
             }
-        }
         }
         if chat_updated {
             let size = terminal.size()?;
@@ -844,8 +893,8 @@ fn run_app(
             }
             AppEvent::Quit => app.quit(),
             AppEvent::NextPane => {
-                if app.is_resume_picker_open() {
-                    // ignore pane focus changes while resume picker is open
+                if is_picker_open(&app) {
+                    // ignore pane focus changes while a picker is open
                 } else if app.active_pane == Pane::LeftBottom && app.autocomplete_top_command() {
                     // keep focus in input when command autocomplete is applied
                 } else {
@@ -853,13 +902,15 @@ fn run_app(
                 }
             }
             AppEvent::PrevPane => {
-                if !app.is_resume_picker_open() {
+                if !is_picker_open(&app) {
                     app.prev_pane();
                 }
             }
             AppEvent::MoveUp => {
                 if app.is_resume_picker_open() {
                     app.resume_picker_move_up();
+                } else if app.is_backend_picker_open() {
+                    app.backend_picker_move_up();
                 } else if app.active_pane == Pane::LeftBottom {
                     let size = terminal.size()?;
                     let width = ui::chat_input_text_width(Rect::new(0, 0, size.width, size.height));
@@ -882,6 +933,8 @@ fn run_app(
             AppEvent::MoveDown => {
                 if app.is_resume_picker_open() {
                     app.resume_picker_move_down();
+                } else if app.is_backend_picker_open() {
+                    app.backend_picker_move_down();
                 } else if app.active_pane == Pane::LeftBottom {
                     let size = terminal.size()?;
                     let width = ui::chat_input_text_width(Rect::new(0, 0, size.width, size.height));
@@ -906,8 +959,8 @@ fn run_app(
                 }
             }
             AppEvent::CursorLeft => {
-                if app.is_resume_picker_open() {
-                    // ignore cursor movement while resume picker is open
+                if is_picker_open(&app) {
+                    // ignore cursor movement while a picker is open
                 } else if app.active_pane == Pane::LeftBottom {
                     app.move_cursor_left();
                 } else if app.active_pane == Pane::Right && app.is_planner_mode() {
@@ -920,8 +973,8 @@ fn run_app(
                 }
             }
             AppEvent::CursorRight => {
-                if app.is_resume_picker_open() {
-                    // ignore cursor movement while resume picker is open
+                if is_picker_open(&app) {
+                    // ignore cursor movement while a picker is open
                 } else if app.active_pane == Pane::LeftBottom {
                     app.move_cursor_right();
                 } else if app.active_pane == Pane::Right && app.is_planner_mode() {
@@ -936,6 +989,8 @@ fn run_app(
             AppEvent::ScrollChatUp => {
                 if app.is_resume_picker_open() {
                     app.resume_picker_move_up();
+                } else if app.is_backend_picker_open() {
+                    app.backend_picker_move_up();
                 } else if app.active_pane == Pane::LeftBottom {
                     app.scroll_chat_up();
                 } else if app.active_pane == Pane::Right {
@@ -947,6 +1002,8 @@ fn run_app(
             AppEvent::ScrollChatDown => {
                 if app.is_resume_picker_open() {
                     app.resume_picker_move_down();
+                } else if app.is_backend_picker_open() {
+                    app.backend_picker_move_down();
                 } else if app.active_pane == Pane::LeftBottom {
                     let size = terminal.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
@@ -1003,6 +1060,24 @@ fn run_app(
                             terminal,
                         )?;
                     }
+                } else if app.is_backend_picker_open() {
+                    if c == ' '
+                        && let Some(selection) = app.select_backend_option()
+                    {
+                        apply_backend_selection(
+                            &mut app,
+                            selection,
+                            &mut selected_backend,
+                            &mut model_routing,
+                            &mut active_worker_context_key,
+                            &mut worker_agent_adapters,
+                            &mut master_adapter,
+                            &mut master_report_adapter,
+                            &mut project_info_adapter,
+                            &mut docs_attach_adapter,
+                            &mut task_check_adapter,
+                        );
+                    }
                 } else if app.active_pane == Pane::LeftBottom {
                     app.input_char(c);
                 } else if app.active_pane == Pane::Right && app.is_planner_mode() {
@@ -1034,11 +1109,16 @@ fn run_app(
                 }
             }
             AppEvent::Backspace => {
-                if app.active_pane == Pane::LeftBottom && !app.is_resume_picker_open() {
+                if app.is_resume_picker_open() {
+                    app.open_resume_picker(Vec::new());
+                    app.push_agent_message("System: Resume picker cancelled.".to_string());
+                } else if app.is_backend_picker_open() {
+                    app.open_backend_picker(Vec::new());
+                    app.push_agent_message("System: Backend picker cancelled.".to_string());
+                } else if app.active_pane == Pane::LeftBottom {
                     app.backspace_input();
                 } else if app.active_pane == Pane::Right
                     && app.is_planner_mode()
-                    && !app.is_resume_picker_open()
                 {
                     let size = terminal.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
@@ -1076,6 +1156,22 @@ fn run_app(
                             &mut task_check_baseline,
                             terminal,
                         )?;
+                    }
+                } else if app.is_backend_picker_open() {
+                    if let Some(selection) = app.select_backend_option() {
+                        apply_backend_selection(
+                            &mut app,
+                            selection,
+                            &mut selected_backend,
+                            &mut model_routing,
+                            &mut active_worker_context_key,
+                            &mut worker_agent_adapters,
+                            &mut master_adapter,
+                            &mut master_report_adapter,
+                            &mut project_info_adapter,
+                            &mut docs_attach_adapter,
+                            &mut task_check_adapter,
+                        );
                     }
                 } else if app.active_pane == Pane::Right && app.is_planner_mode() {
                     let size = terminal.size()?;
@@ -1126,7 +1222,7 @@ fn run_app(
                         || App::is_remove_final_audit_command(&pending)
                     {
                         if let Some(message) = app.consume_chat_input_trimmed() {
-                            submit_user_message(
+                            submit_user_message_with_runtime(
                                 &mut app,
                                 message,
                                 &master_adapter,
@@ -1152,11 +1248,12 @@ fn run_app(
                                 &mut project_info_in_flight,
                                 &mut project_info_stage,
                                 &mut project_info_text,
-                                &model_routing,
+                                &mut model_routing,
+                                &mut selected_backend,
                             )?;
                         }
                     } else if let Some(message) = app.submit_chat_message() {
-                        submit_user_message(
+                        submit_user_message_with_runtime(
                             &mut app,
                             message,
                             &master_adapter,
@@ -1182,7 +1279,8 @@ fn run_app(
                             &mut project_info_in_flight,
                             &mut project_info_stage,
                             &mut project_info_text,
-                            &model_routing,
+                            &mut model_routing,
+                            &mut selected_backend,
                         )?;
                     }
                 }
@@ -1190,6 +1288,8 @@ fn run_app(
             AppEvent::MouseScrollUp => {
                 if app.is_resume_picker_open() {
                     app.resume_picker_move_up();
+                } else if app.is_backend_picker_open() {
+                    app.backend_picker_move_up();
                 } else if app.active_pane == Pane::LeftBottom {
                     app.scroll_chat_up();
                 } else if app.active_pane == Pane::Right {
@@ -1201,6 +1301,8 @@ fn run_app(
             AppEvent::MouseScrollDown => {
                 if app.is_resume_picker_open() {
                     app.resume_picker_move_down();
+                } else if app.is_backend_picker_open() {
+                    app.backend_picker_move_down();
                 } else if app.active_pane == Pane::LeftBottom {
                     let size = terminal.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
@@ -1219,7 +1321,7 @@ fn run_app(
                 }
             }
             AppEvent::MouseLeftClick(column, row) => {
-                if !app.is_resume_picker_open() {
+                if !is_picker_open(&app) {
                     let size = terminal.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
                     if let Some(pane) = ui::pane_hit_test(screen, column, row) {
@@ -1248,7 +1350,7 @@ fn run_app(
     Ok(())
 }
 
-fn submit_user_message<B: Backend>(
+fn submit_user_message_with_runtime<B: Backend>(
     app: &mut App,
     message: String,
     master_adapter: &CodexAdapter,
@@ -1274,7 +1376,8 @@ fn submit_user_message<B: Backend>(
     project_info_in_flight: &mut bool,
     project_info_stage: &mut Option<ProjectInfoStage>,
     project_info_text: &mut Option<String>,
-    model_routing: &CodexAgentModelRouting,
+    model_routing: &mut CodexAgentModelRouting,
+    selected_backend: &mut BackendKind,
 ) -> io::Result<()> {
     let orchestration_service = DefaultCoreOrchestrationService;
     let prompt_service = DefaultUiPromptService;
@@ -1459,6 +1562,20 @@ fn submit_user_message<B: Backend>(
         return Ok(());
     }
 
+    if is_backend_command(&message) {
+        let options = backend_picker_options(*selected_backend);
+        app.open_backend_picker(options);
+        app.push_agent_message(
+            "System: Select a backend in the picker and press Enter or Space (Backspace cancels)."
+                .to_string(),
+        );
+        let size = terminal.size()?;
+        let screen = Rect::new(0, 0, size.width, size.height);
+        let max_scroll = ui::chat_max_scroll(screen, app);
+        app.set_chat_scroll(max_scroll);
+        return Ok(());
+    }
+
     if App::is_planner_mode_command(&message) {
         let active_session = session_store
             .as_ref()
@@ -1616,6 +1733,69 @@ fn submit_user_message<B: Backend>(
     let max_scroll = ui::chat_max_scroll(screen, app);
     app.set_chat_scroll(max_scroll);
     Ok(())
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn submit_user_message<B: Backend>(
+    app: &mut App,
+    message: String,
+    master_adapter: &CodexAdapter,
+    master_report_adapter: &CodexAdapter,
+    project_info_adapter: &CodexAdapter,
+    worker_agent_adapters: &mut HashMap<String, CodexAdapter>,
+    active_worker_context_key: &mut Option<String>,
+    docs_attach_adapter: &CodexAdapter,
+    test_runner_adapter: &TestRunnerAdapter,
+    master_report_in_flight: &mut bool,
+    pending_master_report_prompts: &mut VecDeque<String>,
+    master_report_transcript: &mut Vec<String>,
+    task_check_in_flight: &mut bool,
+    task_check_baseline: &mut Option<String>,
+    session_store: &mut Option<SessionStore>,
+    cwd: &Path,
+    terminal: &mut Terminal<B>,
+    pending_task_write_baseline: &mut Option<TaskWriteBaseline>,
+    docs_attach_in_flight: &mut bool,
+    master_session_intro_needed: &mut bool,
+    master_report_session_intro_needed: &mut bool,
+    pending_master_message_after_project_info: &mut Option<String>,
+    project_info_in_flight: &mut bool,
+    project_info_stage: &mut Option<ProjectInfoStage>,
+    project_info_text: &mut Option<String>,
+    model_routing: &CodexAgentModelRouting,
+) -> io::Result<()> {
+    let mut routing = model_routing.clone();
+    let mut selected_backend = routing.base_command_config().backend_kind();
+    submit_user_message_with_runtime(
+        app,
+        message,
+        master_adapter,
+        master_report_adapter,
+        project_info_adapter,
+        worker_agent_adapters,
+        active_worker_context_key,
+        docs_attach_adapter,
+        test_runner_adapter,
+        master_report_in_flight,
+        pending_master_report_prompts,
+        master_report_transcript,
+        task_check_in_flight,
+        task_check_baseline,
+        session_store,
+        cwd,
+        terminal,
+        pending_task_write_baseline,
+        docs_attach_in_flight,
+        master_session_intro_needed,
+        master_report_session_intro_needed,
+        pending_master_message_after_project_info,
+        project_info_in_flight,
+        project_info_stage,
+        project_info_text,
+        &mut routing,
+        &mut selected_backend,
+    )
 }
 
 fn resumed_right_pane_mode(tasks: &[PlannerTaskFileEntry]) -> RightPaneMode {
@@ -2066,6 +2246,180 @@ fn reset_task_check_runtime(
     *task_check_baseline = None;
 }
 
+fn is_picker_open(app: &App) -> bool {
+    app.is_resume_picker_open() || app.is_backend_picker_open()
+}
+
+fn backend_label(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Codex => "codex",
+        BackendKind::Claude => "claude",
+    }
+}
+
+fn backend_picker_options(selected_backend: BackendKind) -> Vec<BackendOption> {
+    let mut options = vec![
+        BackendOption {
+            kind: BackendKind::Codex,
+            label: "Codex",
+            description: "OpenAI Codex backend",
+        },
+        BackendOption {
+            kind: BackendKind::Claude,
+            label: "Claude",
+            description: "Anthropic Claude backend",
+        },
+    ];
+    if selected_backend == BackendKind::Claude {
+        options.swap(0, 1);
+    }
+    options
+}
+
+fn update_backend_selected_in_toml(
+    text: &str,
+    selected_backend: BackendKind,
+) -> io::Result<String> {
+    let mut value = if text.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str::<toml::Value>(text)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+    };
+    let Some(table) = value.as_table_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config root is not a TOML table",
+        ));
+    };
+    let backend = table
+        .entry("backend")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let Some(backend_table) = backend.as_table_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backend section is not a TOML table",
+        ));
+    };
+    backend_table.insert(
+        "selected".to_string(),
+        toml::Value::String(backend_label(selected_backend).to_string()),
+    );
+    toml::to_string_pretty(&value).map_err(io::Error::other)
+}
+
+fn persist_backend_selection(selected_backend: BackendKind) -> io::Result<std::path::PathBuf> {
+    let config_file = ensure_default_metaagent_config()?;
+    let existing = std::fs::read_to_string(&config_file).unwrap_or_default();
+    let updated = update_backend_selected_in_toml(&existing, selected_backend)?;
+    std::fs::write(&config_file, updated)?;
+    Ok(config_file)
+}
+
+fn rebuild_runtime_adapters(
+    model_routing: &CodexAgentModelRouting,
+    selected_backend: BackendKind,
+    master_adapter: &mut CodexAdapter,
+    master_report_adapter: &mut CodexAdapter,
+    project_info_adapter: &mut CodexAdapter,
+    docs_attach_adapter: &mut CodexAdapter,
+    task_check_adapter: &mut CodexAdapter,
+    active_worker_context_key: &mut Option<String>,
+    worker_agent_adapters: &mut HashMap<String, CodexAdapter>,
+) {
+    *master_adapter = build_json_persistent_adapter(model_routing, selected_backend, CodexAgentKind::Master);
+    *master_report_adapter = build_json_persistent_adapter(
+        model_routing,
+        selected_backend,
+        CodexAgentKind::MasterReport,
+    );
+    *project_info_adapter = build_json_persistent_adapter(
+        model_routing,
+        selected_backend,
+        CodexAgentKind::ProjectInfo,
+    );
+    *docs_attach_adapter = build_plain_adapter(
+        model_routing,
+        selected_backend,
+        CodexAgentKind::DocsAttach,
+        false,
+    );
+    *task_check_adapter = build_plain_adapter(
+        model_routing,
+        selected_backend,
+        CodexAgentKind::TaskCheck,
+        false,
+    );
+    worker_agent_adapters.clear();
+    *active_worker_context_key = None;
+}
+
+fn rebuild_model_routing_with_backend_selection(
+    model_routing: &mut CodexAgentModelRouting,
+    selected_backend: BackendKind,
+) -> io::Result<()> {
+    let merged = load_merged_metaagent_config_text().unwrap_or_default();
+    let updated = update_backend_selected_in_toml(&merged, selected_backend)?;
+    *model_routing = CodexAgentModelRouting::from_toml_str(&updated)?;
+    Ok(())
+}
+
+fn apply_backend_selection(
+    app: &mut App,
+    selected: BackendOption,
+    selected_backend: &mut BackendKind,
+    model_routing: &mut CodexAgentModelRouting,
+    active_worker_context_key: &mut Option<String>,
+    worker_agent_adapters: &mut HashMap<String, CodexAdapter>,
+    master_adapter: &mut CodexAdapter,
+    master_report_adapter: &mut CodexAdapter,
+    project_info_adapter: &mut CodexAdapter,
+    docs_attach_adapter: &mut CodexAdapter,
+    task_check_adapter: &mut CodexAdapter,
+) {
+    let target = selected.kind;
+    let was = *selected_backend;
+    if was == target {
+        app.push_agent_message(format!("System: Backend remains {}.", selected.label));
+        return;
+    }
+    *selected_backend = target;
+    if let Err(err) = rebuild_model_routing_with_backend_selection(model_routing, target) {
+        app.push_agent_message(format!(
+            "System: Backend switched to {} in memory, but model config reload failed: {err}. Using fallback defaults for future adapters.",
+            selected.label
+        ));
+        *model_routing = CodexAgentModelRouting::from_toml_str(&format!(
+            "[backend]\nselected = \"{}\"\n",
+            backend_label(target)
+        ))
+        .unwrap_or_default();
+    }
+    rebuild_runtime_adapters(
+        model_routing,
+        target,
+        master_adapter,
+        master_report_adapter,
+        project_info_adapter,
+        docs_attach_adapter,
+        task_check_adapter,
+        active_worker_context_key,
+        worker_agent_adapters,
+    );
+
+    match persist_backend_selection(target) {
+        Ok(config_file) => app.push_agent_message(format!(
+            "System: Backend set to {}. Saved to {}. New adapters will use this backend.",
+            selected.label,
+            config_file.display()
+        )),
+        Err(err) => app.push_agent_message(format!(
+            "System: Backend set to {} for this run, but persistence to ~/.metaagent/config.toml failed: {err}. New adapters in this run will still use this backend.",
+            selected.label
+        )),
+    }
+}
+
 fn scroll_right_up_global(app: &mut App) {
     for _ in 0..GLOBAL_RIGHT_SCROLL_LINES {
         app.scroll_right_up();
@@ -2162,6 +2516,9 @@ fn submit_block_reason(
     message: &str,
 ) -> Option<SubmitBlockReason> {
     if App::is_quit_command(message) {
+        return None;
+    }
+    if is_backend_command(message) {
         return None;
     }
     if project_info_in_flight {
@@ -2318,12 +2675,17 @@ fn is_slash_start_command(message: &str) -> bool {
     trimmed.starts_with('/') && App::is_start_execution_command(trimmed)
 }
 
+fn is_backend_command(message: &str) -> bool {
+    message.trim().eq_ignore_ascii_case("/backend")
+}
+
 fn is_known_slash_command(message: &str) -> bool {
     let trimmed = message.trim();
     if !trimmed.starts_with('/') {
         return false;
     }
     App::is_start_execution_command(trimmed)
+        || is_backend_command(trimmed)
         || App::is_planner_mode_command(trimmed)
         || App::is_skip_plan_command(trimmed)
         || App::is_convert_command(trimmed)
@@ -2579,11 +2941,7 @@ enum CliEnvelope {
     Err { error: api::ApiErrorEnvelope },
 }
 
-fn run_cli_command(
-    command: RootCommand,
-    output_mode: CliOutputMode,
-    verbose: bool,
-) -> i32 {
+fn run_cli_command(command: RootCommand, output_mode: CliOutputMode, verbose: bool) -> i32 {
     let registry = TransportAdapterRegistry::register_defaults();
     let result = registry.dispatch(command);
     emit_cli_result(result, output_mode, verbose)
@@ -3826,7 +4184,10 @@ fn is_capability_definition_list(payload: &Value) -> bool {
 
 fn render_capability_list_human(capabilities: &[Value]) {
     for capability in capabilities {
-        let id = capability.get("id").and_then(Value::as_str).unwrap_or("<missing-id>");
+        let id = capability
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing-id>");
         let domain = capability
             .get("domain")
             .and_then(Value::as_str)
