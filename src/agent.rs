@@ -139,6 +139,7 @@ impl CodexAdapter {
 
     pub fn send_prompt(&self, prompt: String) {
         let config = self.config.clone();
+        let program = config.program.clone();
         let tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
         thread::spawn(move || {
@@ -161,7 +162,7 @@ impl CodexAdapter {
                 Ok(child) => child,
                 Err(err) => {
                     let _ = tx.send(AgentEvent::System(format!(
-                        "Codex adapter failed to start: {err}"
+                        "Adapter ({program}) failed to start: {err}"
                     )));
                     let _ = tx.send(AgentEvent::Completed {
                         success: false,
@@ -179,6 +180,8 @@ impl CodexAdapter {
                     tx.clone(),
                     config.output_mode,
                     Some(session_id.clone()),
+                    config.backend_kind(),
+                    false,
                 ));
             }
             if let Some(stderr) = child.stderr.take() {
@@ -187,6 +190,8 @@ impl CodexAdapter {
                     tx.clone(),
                     config.output_mode,
                     Some(session_id.clone()),
+                    config.backend_kind(),
+                    true,
                 ));
             }
 
@@ -198,13 +203,13 @@ impl CodexAdapter {
                 // Those descendants may inherit stdout/stderr and keep pipes open, causing reader
                 // joins to block forever after the main process exits. Emit completion immediately
                 // after wait so scheduling can continue.
-                emit_completion_event(&tx, wait_result);
+                emit_completion_event(&tx, &program, wait_result);
                 return;
             }
             for reader in readers {
                 let _ = reader.join();
             }
-            emit_completion_event(&tx, wait_result);
+            emit_completion_event(&tx, &program, wait_result);
         });
     }
 
@@ -254,11 +259,13 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     tx: Sender<AgentEvent>,
     output_mode: AdapterOutputMode,
     session_id: Option<Arc<Mutex<Option<String>>>>,
+    backend_kind: BackendKind,
+    is_stderr: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             if let Some(state) = &session_id
-                && let Some(found) = parse_session_id_from_jsonl_line(&line)
+                && let Some(found) = parse_session_id_from_jsonl_line(&line, backend_kind)
                 && let Ok(mut lock) = state.lock()
                 && lock.is_none()
             {
@@ -271,6 +278,10 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                 AdapterOutputMode::JsonAssistantOnly => {
                     if let Some(text) = parse_agent_message_from_jsonl_line(&line) {
                         let _ = tx.send(AgentEvent::Output(text));
+                    } else if let Some(system_line) = parse_system_message_from_jsonl_line(&line) {
+                        let _ = tx.send(AgentEvent::System(system_line));
+                    } else if is_stderr {
+                        let _ = tx.send(AgentEvent::System(line));
                     }
                 }
             }
@@ -280,14 +291,86 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 
 fn parse_agent_message_from_jsonl_line(line: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if value.get("type")?.as_str()? != "item.completed" {
-        return None;
+    match value.get("type")?.as_str()? {
+        "item.completed" => {
+            let item = value.get("item")?;
+            if item.get("type")?.as_str()? != "agent_message" {
+                return None;
+            }
+            item.get("text")?.as_str().map(ToString::to_string)
+        }
+        "assistant" => {
+            let message = value.get("message")?;
+            parse_text_from_message_content(message)
+        }
+        "result" => value.get("result")?.as_str().map(ToString::to_string),
+        "stream_event" => {
+            let event = value.get("event")?;
+            let delta = event.get("delta")?;
+            if delta.get("type").and_then(|value| value.as_str()) == Some("text_delta") {
+                delta.get("text")?.as_str().map(ToString::to_string)
+            } else if delta.get("type").and_then(|value| value.as_str()) == Some("text") {
+                delta.get("text").and_then(|text| text.as_str()).map(ToString::to_string)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
-    let item = value.get("item")?;
-    if item.get("type")?.as_str()? != "agent_message" {
-        return None;
+}
+
+fn parse_text_from_message_content(message: &serde_json::Value) -> Option<String> {
+    let content = message
+        .get("content")
+        .or_else(|| message.get("message")?.get("content"))?
+        .as_array()?;
+    let mut chunks = Vec::new();
+    for block in content {
+        let block_type = block.get("type").and_then(|value| value.as_str()).unwrap_or("");
+        if block_type == "text" {
+            if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
+                chunks.push(text.to_string());
+            }
+        }
     }
-    item.get("text")?.as_str().map(ToString::to_string)
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks.join(""))
+    }
+}
+
+fn parse_system_message_from_jsonl_line(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let message = extract_error_message(&value)?;
+    let kind = value.get("type").and_then(|value| value.as_str()).unwrap_or("");
+    if kind == "error" {
+        return Some(message);
+    }
+    if value.get("is_error").and_then(|value| value.as_bool()) == Some(true) {
+        return Some(message);
+    }
+    if value.get("subtype").and_then(|value| value.as_str()) == Some("error") {
+        return Some(message);
+    }
+    None
+}
+
+fn extract_error_message(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.get("error").and_then(|value| value.as_str()) {
+        return Some(text.to_string());
+    }
+    if let Some(message) = value
+        .get("error")
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+    {
+        return Some(message.to_string());
+    }
+    value
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
 }
 
 fn sanitize_resume_args(args: Vec<String>) -> Vec<String> {
@@ -399,6 +482,7 @@ fn append_claude_model_selection_args(args: &mut Vec<String>, model: Option<&str
 
 fn emit_completion_event(
     tx: &Sender<AgentEvent>,
+    program: &str,
     wait_result: std::io::Result<std::process::ExitStatus>,
 ) {
     match wait_result {
@@ -410,13 +494,13 @@ fn emit_completion_event(
             });
             if !status.success() {
                 let _ = tx.send(AgentEvent::System(format!(
-                    "Codex adapter exited with status code {code}"
+                    "Adapter ({program}) exited with status code {code}"
                 )));
             }
         }
         Err(err) => {
             let _ = tx.send(AgentEvent::System(format!(
-                "Codex adapter failed while waiting for process: {err}"
+                "Adapter ({program}) failed while waiting for process: {err}"
             )));
             let _ = tx.send(AgentEvent::Completed {
                 success: false,
@@ -426,8 +510,25 @@ fn emit_completion_event(
     }
 }
 
-fn parse_session_id_from_jsonl_line(line: &str) -> Option<String> {
+fn parse_session_id_from_jsonl_line(line: &str, backend_kind: BackendKind) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if matches!(backend_kind, BackendKind::Claude) {
+        let direct = value.get("session_id").and_then(|v| v.as_str());
+        if let Some(id) = direct
+            && looks_like_session_id(id)
+        {
+            return Some(id.to_string());
+        }
+        let session_obj = value.get("session")?;
+        let nested = session_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .or_else(|| session_obj.get("session_id").and_then(|v| v.as_str()));
+        return nested
+            .filter(|id| looks_like_session_id(id))
+            .map(ToString::to_string);
+    }
+
     let direct = value
         .get("session_id")
         .and_then(|v| v.as_str())

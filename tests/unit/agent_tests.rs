@@ -67,11 +67,35 @@ fn plain_text_persistent_config_enables_persistent_session() {
 fn parses_session_id_from_jsonl_event() {
     let line =
         r#"{"type":"session.started","session":{"id":"123e4567-e89b-12d3-a456-426614174000"}}"#;
-    let parsed = parse_session_id_from_jsonl_line(line);
+    let parsed = parse_session_id_from_jsonl_line(line, BackendKind::Codex);
     assert_eq!(
         parsed.as_deref(),
         Some("123e4567-e89b-12d3-a456-426614174000")
     );
+}
+
+#[test]
+fn claude_session_parser_ignores_thread_id_without_session_id() {
+    let line = r#"{"type":"system","thread_id":"thread-12345678"}"#;
+    let parsed = parse_session_id_from_jsonl_line(line, BackendKind::Claude);
+    assert!(parsed.is_none());
+}
+
+#[test]
+fn claude_session_parser_reads_session_id() {
+    let line = r#"{"type":"result","session_id":"123e4567-e89b-12d3-a456-426614174000"}"#;
+    let parsed = parse_session_id_from_jsonl_line(line, BackendKind::Claude);
+    assert_eq!(
+        parsed.as_deref(),
+        Some("123e4567-e89b-12d3-a456-426614174000")
+    );
+}
+
+#[test]
+fn codex_session_parser_keeps_thread_id_fallback() {
+    let line = r#"{"type":"session.started","thread_id":"thread-12345678"}"#;
+    let parsed = parse_session_id_from_jsonl_line(line, BackendKind::Codex);
+    assert_eq!(parsed.as_deref(), Some("thread-12345678"));
 }
 
 #[test]
@@ -379,12 +403,17 @@ fn adapter_spawn_error_still_emits_completed_event() {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut saw_completed = false;
+    let mut saw_error = false;
     while Instant::now() < deadline {
         for event in adapter.drain_events() {
             if let AgentEvent::Completed { success, code } = event {
                 assert!(!success);
                 assert_eq!(code, -1);
                 saw_completed = true;
+            } else if let AgentEvent::System(line) = event {
+                if line.contains("Adapter (__no_such_program__)") {
+                    saw_error = true;
+                }
             }
         }
         if saw_completed {
@@ -397,6 +426,7 @@ fn adapter_spawn_error_still_emits_completed_event() {
         saw_completed,
         "expected completed event even when process spawn fails"
     );
+    assert!(saw_error, "expected executable name in startup error");
 }
 
 #[test]
@@ -413,12 +443,17 @@ fn claude_backend_spawn_error_still_emits_completed_event() {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut saw_completed = false;
+    let mut saw_error = false;
     while Instant::now() < deadline {
         for event in adapter.drain_events() {
             if let AgentEvent::Completed { success, code } = event {
                 assert!(!success);
                 assert_eq!(code, -1);
                 saw_completed = true;
+            } else if let AgentEvent::System(line) = event {
+                if line.contains("Adapter (__no_such_claude_binary__)") {
+                    saw_error = true;
+                }
             }
         }
         if saw_completed {
@@ -431,6 +466,7 @@ fn claude_backend_spawn_error_still_emits_completed_event() {
         saw_completed,
         "expected completed event even when Claude process spawn fails"
     );
+    assert!(saw_error, "expected executable name in startup error");
 }
 
 #[test]
@@ -478,9 +514,38 @@ fn parses_only_json_agent_message_lines() {
         parse_agent_message_from_jsonl_line(line),
         Some("hello".to_string())
     );
+    let assistant_line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"from assistant"}]}}"#;
+    assert_eq!(
+        parse_agent_message_from_jsonl_line(assistant_line),
+        Some("from assistant".to_string())
+    );
+    let stream_line =
+        r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"streamed "}}}"#;
+    assert_eq!(
+        parse_agent_message_from_jsonl_line(stream_line),
+        Some("streamed ".to_string())
+    );
+    let stream_result_line =
+        r#"{"type":"result","result":"final","subtype":"success","session_id":"sid"}"#;
+    assert_eq!(
+        parse_agent_message_from_jsonl_line(stream_result_line),
+        Some("final".to_string())
+    );
     let non_agent = r#"{"type":"item.completed","item":{"type":"reasoning","text":"x"}}"#;
     assert_eq!(parse_agent_message_from_jsonl_line(non_agent), None);
     assert_eq!(parse_agent_message_from_jsonl_line("not-json"), None);
+}
+
+#[test]
+fn parses_json_error_lines_into_system_messages() {
+    let error_line =
+        r#"{"type":"result","subtype":"error","is_error":true,"error":{"message":"resume failed"}}"#;
+    assert_eq!(
+        parse_system_message_from_jsonl_line(error_line),
+        Some("resume failed".to_string())
+    );
+    let regular_line = r#"{"type":"result","subtype":"success","result":"ok"}"#;
+    assert_eq!(parse_system_message_from_jsonl_line(regular_line), None);
 }
 
 #[test]
