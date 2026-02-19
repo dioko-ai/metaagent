@@ -87,6 +87,8 @@ pub struct App {
     chat_messages_generation: u64,
     right_lines: Vec<String>,
     planner_markdown: String,
+    planner_cursor: usize,
+    planner_cursor_goal_col: Option<u16>,
     left_top_scroll: u16,
     chat_scroll: u16,
     right_scroll: u16,
@@ -128,6 +130,8 @@ impl Default for App {
                 "Use /convert when you're ready to implement from the plan.".to_string(),
             ],
             planner_markdown: String::new(),
+            planner_cursor: 0,
+            planner_cursor_goal_col: None,
             left_top_scroll: 0,
             chat_scroll: 0,
             right_scroll: 0,
@@ -780,8 +784,116 @@ impl App {
     }
 
     pub fn set_planner_markdown(&mut self, markdown: String) {
+        let max_cursor = markdown.chars().count();
         self.planner_markdown = markdown;
+        self.planner_cursor = self.planner_cursor.min(max_cursor);
+        self.planner_cursor_goal_col = None;
         self.refresh_right_lines();
+    }
+
+    pub fn planner_markdown(&self) -> &str {
+        &self.planner_markdown
+    }
+
+    pub fn planner_input_char(&mut self, c: char) {
+        let byte_idx = char_to_byte_idx(&self.planner_markdown, self.planner_cursor);
+        self.planner_markdown.insert(byte_idx, c);
+        self.planner_cursor = self.planner_cursor.saturating_add(1);
+        self.planner_cursor_goal_col = None;
+        self.refresh_right_lines();
+    }
+
+    pub fn planner_insert_newline(&mut self) {
+        self.planner_input_char('\n');
+    }
+
+    pub fn planner_backspace(&mut self) {
+        if self.planner_cursor == 0 {
+            return;
+        }
+        let start = char_to_byte_idx(&self.planner_markdown, self.planner_cursor.saturating_sub(1));
+        let end = char_to_byte_idx(&self.planner_markdown, self.planner_cursor);
+        self.planner_markdown.drain(start..end);
+        self.planner_cursor = self.planner_cursor.saturating_sub(1);
+        self.planner_cursor_goal_col = None;
+        self.refresh_right_lines();
+    }
+
+    pub fn planner_move_cursor_left(&mut self) {
+        self.planner_cursor = self.planner_cursor.saturating_sub(1);
+        self.planner_cursor_goal_col = None;
+    }
+
+    pub fn planner_move_cursor_right(&mut self) {
+        let char_len = self.planner_markdown.chars().count();
+        self.planner_cursor = (self.planner_cursor + 1).min(char_len);
+        self.planner_cursor_goal_col = None;
+    }
+
+    pub fn planner_move_cursor_up(&mut self, width: u16) {
+        let width = width.max(1);
+        let positions = wrap_word_with_positions(&self.planner_markdown, width).positions;
+        let (line, col) = positions[self.planner_cursor];
+        if line == 0 {
+            return;
+        }
+        let goal_col = self.planner_cursor_goal_col.unwrap_or(col);
+        self.planner_cursor = nearest_index_for_line_col(&positions, line - 1, goal_col);
+        self.planner_cursor_goal_col = Some(goal_col);
+    }
+
+    pub fn planner_move_cursor_down(&mut self, width: u16) {
+        let width = width.max(1);
+        let positions = wrap_word_with_positions(&self.planner_markdown, width).positions;
+        let (line, col) = positions[self.planner_cursor];
+        let max_line = positions.iter().map(|(l, _)| *l).max().unwrap_or(0);
+        if line >= max_line {
+            return;
+        }
+        let goal_col = self.planner_cursor_goal_col.unwrap_or(col);
+        self.planner_cursor = nearest_index_for_line_col(&positions, line + 1, goal_col);
+        self.planner_cursor_goal_col = Some(goal_col);
+    }
+
+    pub fn planner_cursor_line_col(&self, width: u16) -> (u16, u16) {
+        let positions = wrap_word_with_positions(&self.planner_markdown, width.max(1)).positions;
+        positions[self.planner_cursor]
+    }
+
+    pub fn planner_cursor_index_for_line_col(&self, width: u16, line: u16, col: u16) -> usize {
+        let positions = wrap_word_with_positions(&self.planner_markdown, width.max(1)).positions;
+        nearest_index_for_line_col(&positions, line, col)
+    }
+
+    pub fn set_planner_cursor(&mut self, cursor: usize) {
+        let max_cursor = self.planner_markdown.chars().count();
+        self.planner_cursor = cursor.min(max_cursor);
+        self.planner_cursor_goal_col = None;
+    }
+
+    pub fn ensure_planner_cursor_visible(
+        &mut self,
+        width: u16,
+        visible_lines: u16,
+        max_scroll: u16,
+    ) {
+        let visible_lines = visible_lines.max(1);
+        let (line, _) = self.planner_cursor_line_col(width.max(1));
+        if line < self.right_scroll {
+            self.right_scroll = line;
+        } else {
+            let visible_bottom = self
+                .right_scroll
+                .saturating_add(visible_lines.saturating_sub(1));
+            if line > visible_bottom {
+                self.right_scroll = line.saturating_sub(visible_lines.saturating_sub(1));
+            }
+        }
+        self.right_scroll = self.right_scroll.min(max_scroll);
+    }
+
+    pub fn has_planner_markdown(&self) -> bool {
+        !self.planner_markdown.trim().is_empty()
     }
 
     fn planner_raw_lines(&self) -> Vec<String> {

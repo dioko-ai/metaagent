@@ -221,6 +221,10 @@ impl SessionStore {
         read_text_file(&self.planner_file)
     }
 
+    pub fn write_planner_markdown(&self, markdown: &str) -> io::Result<()> {
+        fs::write(&self.planner_file, markdown)
+    }
+
     pub fn write_rolling_context(&self, entries: &[String]) -> io::Result<()> {
         let text = serde_json::to_string_pretty(entries).map_err(io::Error::other)?;
         write_text_file(&self.context_file, &text)

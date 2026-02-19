@@ -865,7 +865,16 @@ fn run_app(
                     let width = ui::chat_input_text_width(Rect::new(0, 0, size.width, size.height));
                     app.move_cursor_up(width);
                 } else if app.active_pane == Pane::Right {
-                    app.scroll_right_up();
+                    if app.is_planner_mode() {
+                        let size = terminal.size()?;
+                        let screen = Rect::new(0, 0, size.width, size.height);
+                        let (width, visible_lines) = ui::planner_editor_metrics(screen);
+                        let max_scroll = ui::right_max_scroll(screen, &app);
+                        app.planner_move_cursor_up(width);
+                        app.ensure_planner_cursor_visible(width, visible_lines, max_scroll);
+                    } else {
+                        app.scroll_right_up();
+                    }
                 } else {
                     app.scroll_up();
                 }
@@ -880,8 +889,15 @@ fn run_app(
                 } else if app.active_pane == Pane::Right {
                     let size = terminal.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
-                    let max_scroll = ui::right_max_scroll(screen, &app);
-                    app.scroll_right_down(max_scroll);
+                    if app.is_planner_mode() {
+                        let (width, visible_lines) = ui::planner_editor_metrics(screen);
+                        let max_scroll = ui::right_max_scroll(screen, &app);
+                        app.planner_move_cursor_down(width);
+                        app.ensure_planner_cursor_visible(width, visible_lines, max_scroll);
+                    } else {
+                        let max_scroll = ui::right_max_scroll(screen, &app);
+                        app.scroll_right_down(max_scroll);
+                    }
                 } else {
                     let size = terminal.size()?;
                     let screen = Rect::new(0, 0, size.width, size.height);
@@ -890,13 +906,31 @@ fn run_app(
                 }
             }
             AppEvent::CursorLeft => {
-                if app.active_pane == Pane::LeftBottom && !app.is_resume_picker_open() {
+                if app.is_resume_picker_open() {
+                    // ignore cursor movement while resume picker is open
+                } else if app.active_pane == Pane::LeftBottom {
                     app.move_cursor_left();
+                } else if app.active_pane == Pane::Right && app.is_planner_mode() {
+                    let size = terminal.size()?;
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    let (width, visible_lines) = ui::planner_editor_metrics(screen);
+                    let max_scroll = ui::right_max_scroll(screen, &app);
+                    app.planner_move_cursor_left();
+                    app.ensure_planner_cursor_visible(width, visible_lines, max_scroll);
                 }
             }
             AppEvent::CursorRight => {
-                if app.active_pane == Pane::LeftBottom && !app.is_resume_picker_open() {
+                if app.is_resume_picker_open() {
+                    // ignore cursor movement while resume picker is open
+                } else if app.active_pane == Pane::LeftBottom {
                     app.move_cursor_right();
+                } else if app.active_pane == Pane::Right && app.is_planner_mode() {
+                    let size = terminal.size()?;
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    let (width, visible_lines) = ui::planner_editor_metrics(screen);
+                    let max_scroll = ui::right_max_scroll(screen, &app);
+                    app.planner_move_cursor_right();
+                    app.ensure_planner_cursor_visible(width, visible_lines, max_scroll);
                 }
             }
             AppEvent::ScrollChatUp => {
@@ -971,6 +1005,14 @@ fn run_app(
                     }
                 } else if app.active_pane == Pane::LeftBottom {
                     app.input_char(c);
+                } else if app.active_pane == Pane::Right && app.is_planner_mode() {
+                    let size = terminal.size()?;
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    let (width, visible_lines) = ui::planner_editor_metrics(screen);
+                    app.planner_input_char(c);
+                    let max_scroll = ui::right_max_scroll(screen, &app);
+                    app.ensure_planner_cursor_visible(width, visible_lines, max_scroll);
+                    persist_planner_markdown_if_possible(&mut app, session_store.as_ref());
                 } else if c == 'j' {
                     if app.active_pane == Pane::Right {
                         let size = terminal.size()?;
@@ -994,6 +1036,17 @@ fn run_app(
             AppEvent::Backspace => {
                 if app.active_pane == Pane::LeftBottom && !app.is_resume_picker_open() {
                     app.backspace_input();
+                } else if app.active_pane == Pane::Right
+                    && app.is_planner_mode()
+                    && !app.is_resume_picker_open()
+                {
+                    let size = terminal.size()?;
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    let (width, visible_lines) = ui::planner_editor_metrics(screen);
+                    app.planner_backspace();
+                    let max_scroll = ui::right_max_scroll(screen, &app);
+                    app.ensure_planner_cursor_visible(width, visible_lines, max_scroll);
+                    persist_planner_markdown_if_possible(&mut app, session_store.as_ref());
                 }
             }
             AppEvent::Submit => {
@@ -1024,6 +1077,14 @@ fn run_app(
                             terminal,
                         )?;
                     }
+                } else if app.active_pane == Pane::Right && app.is_planner_mode() {
+                    let size = terminal.size()?;
+                    let screen = Rect::new(0, 0, size.width, size.height);
+                    let (width, visible_lines) = ui::planner_editor_metrics(screen);
+                    app.planner_insert_newline();
+                    let max_scroll = ui::right_max_scroll(screen, &app);
+                    app.ensure_planner_cursor_visible(width, visible_lines, max_scroll);
+                    persist_planner_markdown_if_possible(&mut app, session_store.as_ref());
                 } else if app.active_pane == Pane::LeftBottom {
                     let pending = app.chat_input().trim().to_string();
                     match submit_block_reason(
@@ -1164,7 +1225,12 @@ fn run_app(
                     if let Some(pane) = ui::pane_hit_test(screen, column, row) {
                         app.active_pane = pane;
                     }
-                    if let Some(task_key) =
+                    if app.is_planner_mode() {
+                        if let Some(cursor) = ui::planner_cursor_hit_test(screen, &app, column, row)
+                        {
+                            app.set_planner_cursor(cursor);
+                        }
+                    } else if let Some(task_key) =
                         ui::right_pane_toggle_hit_test(screen, &app, column, row)
                     {
                         app.toggle_task_details(&task_key);
@@ -1954,6 +2020,22 @@ fn claim_next_worker_job_and_persist_snapshot(
         ));
     }
     job
+}
+
+fn persist_planner_markdown_if_possible(app: &mut App, session_store: Option<&SessionStore>) {
+    let Some(session_store) = session_store else {
+        return;
+    };
+    if let Err(err) = session_store.write_planner_markdown(app.planner_markdown()) {
+        app.push_agent_message(format!(
+            "System: Failed to write planner markdown to planner.md: {err}"
+        ));
+    }
+}
+
+fn capture_tasks_baseline(session_store: &SessionStore) -> Option<TaskWriteBaseline> {
+    let tasks_json = std::fs::read_to_string(session_store.tasks_file()).ok()?;
+    Some(TaskWriteBaseline { tasks_json })
 }
 
 fn tasks_changed_since_baseline(before: Option<&str>, after: Option<&str>) -> bool {

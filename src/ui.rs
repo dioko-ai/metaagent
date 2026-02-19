@@ -5,6 +5,10 @@ use std::sync::Arc;
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph};
+use ratatui_core::layout::Alignment as CoreAlignment;
+use ratatui_core::style::{Color as CoreColor, Modifier as CoreModifier, Style as CoreStyle};
+use ratatui_core::text::{Line as CoreLine, Span as CoreSpan, Text as CoreText};
+use tui_markdown::from_str;
 
 use crate::app::{App, CommandSuggestion, Pane};
 use crate::text_layout::wrap_word_with_positions;
@@ -103,7 +107,11 @@ pub fn right_max_scroll(screen: Rect, app: &App) -> u16 {
         return 0;
     }
     let text_width = content.width.saturating_sub(TEXT_PADDING * 2).max(1);
-    let total_lines = app.right_block_lines(text_width).len() as u16;
+    let total_lines = if app.is_planner_mode() && app.active_pane == Pane::Right {
+        wrap_word_with_positions(app.planner_markdown(), text_width).line_count
+    } else {
+        app.right_block_lines(text_width).len() as u16
+    };
     let visible_lines = content.height.saturating_sub(TEXT_PADDING * 2);
     total_lines.saturating_sub(visible_lines)
 }
@@ -678,6 +686,14 @@ fn wrap_text_lines(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
+fn right_pane_layout(screen: Rect) -> [Rect; 2] {
+    let [body, _status] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(screen);
+    let [_left, right] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
+    Layout::vertical([Constraint::Length(TITLE_BAR_HEIGHT), Constraint::Min(0)]).areas(right)
+}
+
 fn render_right_task_pane(frame: &mut Frame, area: Rect, app: &App, active: bool, theme: &Theme) {
     let [title_area, content_area] =
         Layout::vertical([Constraint::Length(TITLE_BAR_HEIGHT), Constraint::Min(0)]).areas(area);
@@ -705,22 +721,115 @@ fn render_right_task_pane(frame: &mut Frame, area: Rect, app: &App, active: bool
 
     let inner_width = content_area.width.saturating_sub(TEXT_PADDING * 2).max(1);
     let view = app.right_block_view(inner_width);
-    let right_text = if app.is_planner_mode() {
-        Text::from(view.lines.join("\n"))
+    if app.is_planner_mode() {
+        if active {
+            let wrapped = wrap_word_with_positions(app.planner_markdown(), inner_width);
+            frame.render_widget(
+                Paragraph::new(wrapped.rendered)
+                    .style(Style::default().bg(theme.right_bg).fg(theme.text_fg))
+                    .scroll((app.right_scroll(), 0))
+                    .block(
+                        Block::default()
+                            .style(Style::default().bg(theme.right_bg))
+                            .padding(Padding::uniform(TEXT_PADDING)),
+                    ),
+                content_area,
+            );
+            let input_inner = content_area.inner(Margin {
+                horizontal: TEXT_PADDING,
+                vertical: TEXT_PADDING,
+            });
+            if input_inner.width > 0 && input_inner.height > 0 {
+                let (cursor_line, cursor_col) = app.planner_cursor_line_col(inner_width);
+                let visible_cursor_line = cursor_line.saturating_sub(app.right_scroll());
+                if visible_cursor_line < input_inner.height {
+                    frame.set_cursor_position((
+                        input_inner
+                            .x
+                            .saturating_add(cursor_col.min(input_inner.width.saturating_sub(1))),
+                        input_inner.y.saturating_add(visible_cursor_line),
+                    ));
+                }
+            }
+        } else {
+            let right_text = if app.has_planner_markdown() {
+                planner_markdown_text(app.planner_markdown())
+            } else {
+                Text::from(view.lines.join("\n"))
+            };
+            frame.render_widget(
+                Paragraph::new(right_text)
+                    .style(Style::default().bg(theme.right_bg).fg(theme.text_fg))
+                    .scroll((app.right_scroll(), 0))
+                    .block(
+                        Block::default()
+                            .style(Style::default().bg(theme.right_bg))
+                            .padding(Padding::uniform(TEXT_PADDING)),
+                    ),
+                content_area,
+            );
+        }
     } else {
-        right_pane_text(&view.lines)
-    };
-    frame.render_widget(
-        Paragraph::new(right_text)
-            .style(Style::default().bg(theme.right_bg).fg(theme.text_fg))
-            .scroll((app.right_scroll(), 0))
-            .block(
-                Block::default()
-                    .style(Style::default().bg(theme.right_bg))
-                    .padding(Padding::uniform(TEXT_PADDING)),
-            ),
-        content_area,
+        frame.render_widget(
+            Paragraph::new(right_pane_text(&view.lines))
+                .style(Style::default().bg(theme.right_bg).fg(theme.text_fg))
+                .scroll((app.right_scroll(), 0))
+                .block(
+                    Block::default()
+                        .style(Style::default().bg(theme.right_bg))
+                        .padding(Padding::uniform(TEXT_PADDING)),
+                ),
+            content_area,
+        );
+    }
+}
+
+pub fn planner_editor_metrics(screen: Rect) -> (u16, u16) {
+    let [_title_area, content_area] = right_pane_layout(screen);
+    let input_inner = content_area.inner(Margin {
+        horizontal: TEXT_PADDING,
+        vertical: TEXT_PADDING,
+    });
+    (input_inner.width.max(1), input_inner.height.max(1))
+}
+
+pub fn planner_cursor_hit_test(screen: Rect, app: &App, x: u16, y: u16) -> Option<usize> {
+    if !app.is_planner_mode() {
+        return None;
+    }
+    let [_title_area, content_area] = right_pane_layout(screen);
+    if x < content_area.x
+        || x >= content_area.x.saturating_add(content_area.width)
+        || y < content_area.y
+        || y >= content_area.y.saturating_add(content_area.height)
+    {
+        return None;
+    }
+
+    let input_inner = content_area.inner(Margin {
+        horizontal: TEXT_PADDING,
+        vertical: TEXT_PADDING,
+    });
+    if input_inner.width == 0 || input_inner.height == 0 {
+        return Some(app.planner_markdown().chars().count());
+    }
+    let clamped_x = x.clamp(
+        input_inner.x,
+        input_inner
+            .x
+            .saturating_add(input_inner.width.saturating_sub(1)),
     );
+    let clamped_y = y.clamp(
+        input_inner.y,
+        input_inner
+            .y
+            .saturating_add(input_inner.height.saturating_sub(1)),
+    );
+    let line = app
+        .right_scroll()
+        .saturating_add(clamped_y.saturating_sub(input_inner.y));
+    let col = clamped_x.saturating_sub(input_inner.x);
+    Some(app.planner_cursor_index_for_line_col(input_inner.width, line, col))
 }
 
 pub fn right_pane_toggle_hit_test(screen: Rect, app: &App, x: u16, y: u16) -> Option<String> {
@@ -728,12 +837,7 @@ pub fn right_pane_toggle_hit_test(screen: Rect, app: &App, x: u16, y: u16) -> Op
         return None;
     }
 
-    let [body, _status] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(screen);
-    let [_left, right] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [_title_area, content_area] =
-        Layout::vertical([Constraint::Length(TITLE_BAR_HEIGHT), Constraint::Min(0)]).areas(right);
+    let [_title_area, content_area] = right_pane_layout(screen);
 
     if x < content_area.x
         || x >= content_area.x.saturating_add(content_area.width)
@@ -916,6 +1020,126 @@ fn right_pane_text(lines: &[String]) -> Text<'static> {
         }
     }
     Text::from(out)
+}
+
+fn planner_markdown_text(markdown: &str) -> Text<'static> {
+    convert_markdown_text(from_str(markdown))
+}
+
+fn convert_markdown_text(markdown: CoreText<'_>) -> Text<'static> {
+    let alignment = markdown.alignment;
+    let style = markdown.style;
+    let mut text = Text::from(
+        markdown
+            .lines
+            .into_iter()
+            .map(convert_markdown_line)
+            .collect::<Vec<_>>(),
+    );
+    if let Some(alignment) = alignment {
+        text = text.alignment(convert_markdown_alignment(alignment));
+    }
+    text = text.style(convert_markdown_style(style));
+    text
+}
+
+fn convert_markdown_line(line: CoreLine<'_>) -> Line<'static> {
+    let alignment = line.alignment;
+    let mut ui_line = Line::from(
+        line.spans
+            .into_iter()
+            .map(convert_markdown_span)
+            .collect::<Vec<_>>(),
+    )
+    .style(convert_markdown_style(line.style));
+    if let Some(alignment) = alignment {
+        ui_line = ui_line.alignment(convert_markdown_alignment(alignment));
+    }
+    ui_line
+}
+
+fn convert_markdown_span(span: CoreSpan<'_>) -> Span<'static> {
+    Span::styled(
+        span.content.to_string(),
+        convert_markdown_style(span.style),
+    )
+}
+
+fn convert_markdown_style(style: CoreStyle) -> Style {
+    let mut output = Style::default();
+    if let Some(fg) = style.fg {
+        output = output.fg(convert_markdown_color(fg));
+    }
+    if let Some(bg) = style.bg {
+        output = output.bg(convert_markdown_color(bg));
+    }
+    output = output.add_modifier(convert_markdown_modifier(style.add_modifier));
+    output = output.remove_modifier(convert_markdown_modifier(style.sub_modifier));
+    output
+}
+
+fn convert_markdown_color(color: CoreColor) -> Color {
+    match color {
+        CoreColor::Reset => Color::Reset,
+        CoreColor::Black => Color::Black,
+        CoreColor::Red => Color::Red,
+        CoreColor::Green => Color::Green,
+        CoreColor::Yellow => Color::Yellow,
+        CoreColor::Blue => Color::Blue,
+        CoreColor::Magenta => Color::Magenta,
+        CoreColor::Cyan => Color::Cyan,
+        CoreColor::Gray => Color::Gray,
+        CoreColor::DarkGray => Color::DarkGray,
+        CoreColor::LightRed => Color::LightRed,
+        CoreColor::LightGreen => Color::LightGreen,
+        CoreColor::LightYellow => Color::LightYellow,
+        CoreColor::LightBlue => Color::LightBlue,
+        CoreColor::LightMagenta => Color::LightMagenta,
+        CoreColor::LightCyan => Color::LightCyan,
+        CoreColor::White => Color::White,
+        CoreColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        CoreColor::Indexed(i) => Color::Indexed(i),
+    }
+}
+
+fn convert_markdown_modifier(modifier: CoreModifier) -> Modifier {
+    let mut output = Modifier::empty();
+    if modifier.contains(CoreModifier::BOLD) {
+        output.insert(Modifier::BOLD);
+    }
+    if modifier.contains(CoreModifier::DIM) {
+        output.insert(Modifier::DIM);
+    }
+    if modifier.contains(CoreModifier::ITALIC) {
+        output.insert(Modifier::ITALIC);
+    }
+    if modifier.contains(CoreModifier::UNDERLINED) {
+        output.insert(Modifier::UNDERLINED);
+    }
+    if modifier.contains(CoreModifier::SLOW_BLINK) {
+        output.insert(Modifier::SLOW_BLINK);
+    }
+    if modifier.contains(CoreModifier::RAPID_BLINK) {
+        output.insert(Modifier::RAPID_BLINK);
+    }
+    if modifier.contains(CoreModifier::REVERSED) {
+        output.insert(Modifier::REVERSED);
+    }
+    if modifier.contains(CoreModifier::HIDDEN) {
+        output.insert(Modifier::HIDDEN);
+    }
+    if modifier.contains(CoreModifier::CROSSED_OUT) {
+        output.insert(Modifier::CROSSED_OUT);
+    }
+    output
+}
+
+fn convert_markdown_alignment(alignment: CoreAlignment) -> Alignment {
+    match alignment {
+        CoreAlignment::Left => Alignment::Left,
+        CoreAlignment::Center => Alignment::Center,
+        CoreAlignment::Right => Alignment::Right,
+    }
 }
 
 fn split_box_line_content(line: &str) -> Option<(&str, &str, &str)> {
