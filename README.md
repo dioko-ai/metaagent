@@ -1,6 +1,6 @@
 # Bob The Agent
 
-<img width="1024" height="1536" alt="bob-the-agent" src="https://github.com/user-attachments/assets/1d2563a3-316d-40ae-92a6-d9bd232fb517" />
+<img width="300" alt="bob-the-agent" src="https://github.com/user-attachments/assets/1d2563a3-316d-40ae-92a6-d9bd232fb517" />
 
 
 **A lightning-fast AI orchestrator that decomposes complex coding tasks into agent-driven workflows — built in Rust.**
