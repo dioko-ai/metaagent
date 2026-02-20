@@ -5,13 +5,13 @@
 
 **A lightning-fast AI orchestrator that decomposes complex coding tasks into agent-driven workflows — built in Rust.**
 
-## What is MetaAgent?
+## What is Bob?
 
-MetaAgent is a TUI and CLI tool that acts as a master planner for software engineering tasks. You describe what you want built, and MetaAgent decomposes your request into a structured task graph, then dispatches a team of specialized AI agents to execute each step — with built-in quality gates and retry loops to ensure correctness.
+Bob is a TUI and CLI tool that acts as a master planner for software engineering tasks. You describe what you want built, and Bob decomposes your request into a structured task graph, then dispatches a team of specialized AI agents to execute each step — with built-in quality gates and retry loops to ensure correctness.
 
-The multi-agent workflow follows a rigorous pipeline: **Implementor** writes the code, an **Auditor** reviews the implementation, a **Test Writer** generates tests, a **Test Runner** executes them, and a **Final Audit** verifies the end result. When an audit or test fails, MetaAgent automatically retries the failing stage with feedback from the previous attempt, creating a self-correcting development loop.
+The multi-agent workflow follows a rigorous pipeline: **Implementor** writes the code, an **Auditor** reviews the implementation, a **Test Writer** generates tests, a **Test Runner** executes them, and a **Final Audit** verifies the end result. When an audit or test fails, Bob automatically retries the failing stage with feedback from the previous attempt, creating a self-correcting development loop.
 
-The interactive TUI provides a three-pane layout: sub-agent output streams in the top-left, a chat and input area occupies the bottom-left, and a task list with planner visualization sits on the right. MetaAgent supports dual backends — **OpenAI Codex CLI** and **Anthropic Claude CLI** — and is written entirely in Rust (~13k lines), delivering a native binary with zero runtime overhead and instant startup.
+The interactive TUI provides a three-pane layout: sub-agent output streams in the top-left, a chat and input area occupies the bottom-left, and a task list with planner visualization sits on the right. Bob supports dual backends — **OpenAI Codex CLI** and **Anthropic Claude CLI** — and is written entirely in Rust (~13k lines), delivering a native binary with zero runtime overhead and instant startup.
 
 ## Key Benefits
 
@@ -60,7 +60,7 @@ The interactive TUI provides a three-pane layout: sub-agent output streams in th
                                 Done ✓
 ```
 
-MetaAgent includes a **collaborative planner mode** where you can interactively refine the task plan before execution. Use `/convert` to transform the planner markdown into a structured task list, then `/start` to kick off the agent pipeline.
+Bob includes a **collaborative planner mode** where you can interactively refine the task plan before execution. Use `/convert` to transform the planner markdown into a structured task list, then `/start` to kick off the agent pipeline.
 
 ## Quick Start
 
@@ -83,7 +83,7 @@ The binary will be at `target/release/metaagent-rust`.
 
 ### Configure
 
-MetaAgent stores its configuration in `~/.metaagent/config.toml`. A default config is created on first run. Key sections:
+Bob stores its configuration in `~/.metaagent/config.toml`. A default config is created on first run. Key sections:
 
 **Model profiles** control which model and thinking effort are used:
 
@@ -173,7 +173,7 @@ cargo build --release --locked
 
 ## Configuration
 
-MetaAgent merges an embedded default configuration (`src/default_config.toml`) with the user config at `~/.metaagent/config.toml`. Missing keys are filled from defaults, so you only need to override what you want to change. The merged config is written back on every launch.
+Bob merges an embedded default configuration (`src/default_config.toml`) with the user config at `~/.metaagent/config.toml`. Missing keys are filled from defaults, so you only need to override what you want to change. The merged config is written back on every launch.
 
 ### Backend selection
 
@@ -250,7 +250,7 @@ TUI colors are customizable via a `theme.toml` file. See `src/theme.rs` for the 
 
 ## Commands Reference
 
-MetaAgent's TUI provides 16 slash commands, organized by category:
+Bob's TUI provides 16 slash commands, organized by category:
 
 ### Planning
 
@@ -290,7 +290,7 @@ MetaAgent's TUI provides 16 slash commands, organized by category:
 
 ## CLI API
 
-MetaAgent exposes a JSON API via the CLI for scripting and automation.
+Bob exposes a JSON API via the CLI for scripting and automation.
 
 ### Output mode
 
