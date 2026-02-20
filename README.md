@@ -31,27 +31,27 @@ The interactive TUI provides a three-pane layout: sub-agent output streams in th
  You describe a task
         │
         ▼
- ┌──────────────┐
+ ┌───────────────┐
  │ Master Planner│  ← Decomposes into task graph
- └──────┬───────┘
+ └──────┬────────┘
         │
         ▼
  ┌──────────────┐     ┌───────────┐
- │ Implementor  │────▶│  Auditor   │──┐
+ │ Implementor  │────▶│  Auditor  │──┐
  └──────────────┘     └───────────┘  │ Fails? Retry (up to 4 passes)
         ▲                            │
         └────────────────────────────┘
                      │ Passes
                      ▼
               ┌─────────────┐     ┌─────────────┐
-              │ Test Writer  │────▶│ Test Runner  │──┐
+              │ Test Writer │────▶│ Test Runner │──┐
               └─────────────┘     └─────────────┘  │ Fails? Retry (up to 5 passes)
-                     ▲                              │
-                     └──────────────────────────────┘
+                     ▲                             │
+                     └─────────────────────────────┘
                                   │ Passes
                                   ▼
                           ┌──────────────┐
-                          │ Final Audit   │──┐
+                          │ Final Audit  │──┐
                           └──────────────┘  │ Fails? Retry (up to 4 passes)
                                  ▲          │
                                  └──────────┘
